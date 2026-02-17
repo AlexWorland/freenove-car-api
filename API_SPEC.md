@@ -169,13 +169,14 @@ Set motor speeds using named commands or direct per-wheel control.
 
 ### POST /control/servos
 
-Set servo angles using named positions or per-channel array.
+Set servo angles using named positions or per-channel array. Supports optional `speed` parameter for smooth interpolated movement.
 
 **Object Mode:**
 ```json
 {
   "pan": 90,
-  "tilt": 120
+  "tilt": 120,
+  "speed": 60
 }
 ```
 
@@ -183,6 +184,7 @@ Set servo angles using named positions or per-channel array.
 |-------|------|-------|-------------|
 | `pan` | int | 0-180 | Horizontal servo (PCA9685 channel 8) |
 | `tilt` | int | 0-180 | Vertical servo (PCA9685 channel 9) |
+| `speed` | int | 0-500 | Movement speed in degrees/sec. 0 = instant jump (default). |
 
 **Array Mode:**
 ```json
@@ -447,6 +449,131 @@ Set `result` variable in your code to return a value in the response.
   "error": "Traceback (most recent call last):\n  ..."
 }
 ```
+
+---
+
+## Camera
+
+### GET /camera/stream
+
+Live MJPEG video stream from the OV5647 camera via `rpicam-vid`.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `width` | int | 320 | 64-1280 | Frame width |
+| `height` | int | 240 | 64-960 | Frame height |
+| `fps` | int | 10 | 1-30 | Target framerate |
+
+**Response:** `multipart/x-mixed-replace` MJPEG stream
+
+**Example:** `<img src="http://<pi-ip>:5000/camera/stream?width=480&height=360&fps=10">`
+
+---
+
+### POST /camera/sweep
+
+Pan+tilt servo sweep capturing a photo at each position (serpentine scan pattern).
+
+**Request Body:**
+```json
+{
+  "pan_min": 0, "pan_max": 180,
+  "tilt_min": 0, "tilt_max": 180,
+  "step": 5,
+  "width": 160, "height": 120,
+  "settle": 0.3
+}
+```
+
+| Field | Type | Default | Range | Description |
+|-------|------|---------|-------|-------------|
+| `pan_min` | int | 0 | 0-180 | Pan start angle |
+| `pan_max` | int | 180 | 0-180 | Pan end angle |
+| `tilt_min` | int | 0 | 0-180 | Tilt start angle |
+| `tilt_max` | int | 180 | 0-180 | Tilt end angle |
+| `step` | int | 5 | 1-45 | Degrees between captures |
+| `width` | int | 160 | 64-640 | Image width |
+| `height` | int | 120 | 64-480 | Image height |
+| `settle` | float | 0.3 | 0.05-2.0 | Servo settle time between positions (seconds) |
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "total_images": 1369,
+  "captured": 1369,
+  "step_deg": 5,
+  "pan_range": [0, 180],
+  "tilt_range": [0, 180],
+  "resolution": [160, 120],
+  "images": [
+    {"pan": 0, "tilt": 0, "image": "<base64 JPEG>"},
+    {"pan": 5, "tilt": 0, "image": "<base64 JPEG>"}
+  ]
+}
+```
+
+---
+
+### GET /system/status
+
+Returns system information: uptime, CPU temperature, Tailscale status, battery voltage, and throttle state.
+
+**Response:**
+```json
+{
+  "uptime": "up 55 minutes",
+  "cpu_temp": "38.6'C",
+  "tailscale": {"status": "connected", "ip": "100.x.x.x", "hostname": "rasberrypi"},
+  "throttled": "throttled=0x50005",
+  "battery_voltage": 7.53
+}
+```
+
+---
+
+### POST /system/reboot
+
+Reboot the Raspberry Pi. Stops all hardware first.
+
+**Request Body:** `{}` (empty)
+
+**Response:**
+```json
+{"status": "ok", "message": "Rebooting in 1 second..."}
+```
+
+---
+
+### POST /system/shutdown
+
+Shutdown the Raspberry Pi. Stops all hardware first.
+
+**Request Body:** `{}` (empty)
+
+**Response:**
+```json
+{"status": "ok", "message": "Shutting down in 1 second..."}
+```
+
+---
+
+## Dashboard
+
+### GET /dashboard
+
+Interactive web-based control panel. Features:
+- Live MJPEG camera feed
+- Motor direction pad with all mecanum directions + speed slider
+- Pan/tilt servo sliders
+- LED color picker, brightness slider, and animation buttons
+- Buzzer hold-to-buzz and beep buttons
+- Auto-refreshing sensor readout (ultrasonic, ADC, infrared, CPU temp)
+- System info panel (uptime, Tailscale, throttle state)
+- System controls (Stop All, Reboot, Shutdown)
+- Keyboard controls (WASD + QE + Arrows + Space)
 
 ---
 
