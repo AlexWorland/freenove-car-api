@@ -182,8 +182,8 @@ Set servo angles using named positions or per-channel array. Supports optional `
 
 | Field | Type | Range | Description |
 |-------|------|-------|-------------|
-| `pan` | int | 0-180 | Horizontal servo (PCA9685 channel 8) |
-| `tilt` | int | 0-180 | Vertical servo (PCA9685 channel 9) |
+| `pan` | int | 0-180 | Horizontal servo (PCA9685 channel 9, software ch 1) |
+| `tilt` | int | 0-180 | Vertical servo (PCA9685 channel 8, software ch 0) |
 | `speed` | int | 0-500 | Movement speed in degrees/sec. 0 = instant jump (default). |
 
 **Array Mode:**
@@ -560,6 +560,212 @@ Shutdown the Raspberry Pi. Stops all hardware first.
 
 ---
 
+## Autonomy
+
+Autonomous navigation endpoints for Claude-as-brain driving. The Pi handles real-time safety (collision avoidance, stuck detection) via a background thread; Claude handles strategy via these HTTP endpoints.
+
+### POST /auto/step
+
+Core decision cycle — one HTTP call per decision. Supports movement commands, scans, recovery, and stop.
+
+**Movement Mode (default):**
+```json
+{
+  "command": "forward",
+  "speed": 1500,
+  "duration": 0.5
+}
+```
+
+**Scan Mode:**
+```json
+{
+  "action": "scan",
+  "scan_params": {"pan_min": 30, "pan_max": 150, "step": 5, "settle_ms": 150}
+}
+```
+
+**Recovery Mode:**
+```json
+{
+  "action": "recover",
+  "recover_maneuver": "back_and_rotate"
+}
+```
+
+**Stop Mode:**
+```json
+{
+  "action": "stop"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `command` | string | "forward" | Movement command (same names as `/control/motors`) |
+| `speed` | int | 1500 | Motor PWM speed (0-4095) |
+| `duration` | float | 0.5 | Movement duration in seconds (0.1-10.0) |
+| `action` | string | null | Override: `"scan"`, `"recover"`, or `"stop"` |
+| `scan_params` | object | null | Parameters for scan action (see `/auto/scan`) |
+| `recover_maneuver` | string | "back_and_rotate" | Recovery maneuver name |
+
+**Response (movement mode):**
+```json
+{
+  "command": "forward",
+  "speed": 1500,
+  "requested_duration": 0.5,
+  "actual_duration": 0.487,
+  "pre_distance_cm": 85.3,
+  "post_distance_cm": 62.1,
+  "infrared": {"left": 0, "middle": 0, "right": 0},
+  "battery_voltage": 7.52,
+  "collision": false,
+  "stuck": false,
+  "pose": {"x_cm": 0.0, "y_cm": 5.1, "heading_deg": 90.0}
+}
+```
+
+**Available commands:** `forward`, `backward`, `left`, `right`, `strafe_left`, `strafe_right`, `rotate_cw`, `rotate_ccw`, `diagonal_fl`, `diagonal_fr`, `diagonal_bl`, `diagonal_br`, `stop`
+
+**Recovery maneuvers:** `back_up`, `back_and_rotate`, `wiggle_free`, `full_retreat`, `strafe_escape_left`, `strafe_escape_right`
+
+---
+
+### POST /auto/scan
+
+Full ultrasonic sweep — rotates the pan servo through a range of angles, reading distance at each position. Updates the internal occupancy grid.
+
+**Request Body:**
+```json
+{
+  "pan_min": 30,
+  "pan_max": 150,
+  "step": 5,
+  "settle_ms": 150
+}
+```
+
+| Field | Type | Default | Range | Description |
+|-------|------|---------|-------|-------------|
+| `pan_min` | int | 30 | 0-180 | Start pan angle (0=right, 180=left) |
+| `pan_max` | int | 150 | 0-180 | End pan angle |
+| `step` | int | 5 | 1-45 | Degrees between readings |
+| `settle_ms` | int | 150 | 50-2000 | Servo settle time (ms) |
+
+**Response:**
+```json
+{
+  "readings": [
+    {"pan_angle": 30, "distance_cm": 145.2},
+    {"pan_angle": 35, "distance_cm": 142.8},
+    "..."
+  ],
+  "pose": {"x_cm": 0.0, "y_cm": 0.0, "heading_deg": 90.0},
+  "count": 25
+}
+```
+
+> **Timing:** A 30°-150° sweep at 5° steps with 150ms settle takes ~9 seconds.
+
+---
+
+### GET /auto/state
+
+Read-only snapshot of current autonomy state.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `include_grid` | bool | false | Include ASCII occupancy grid |
+| `grid_radius` | int | 20 | Half-width of text grid (5-50) |
+
+**Response:**
+```json
+{
+  "pose": {"x_cm": 12.3, "y_cm": 45.6, "heading_deg": 90.0},
+  "collision_flag": false,
+  "stuck_flag": false
+}
+```
+
+**Response (with grid):**
+```json
+{
+  "pose": {"x_cm": 12.3, "y_cm": 45.6, "heading_deg": 90.0},
+  "collision_flag": false,
+  "stuck_flag": false,
+  "grid": "??????????????????????????????????\n??????????????..............??????\n??????????????..............??????\n??????????????......^.......??????\n??????????????..............??????\n??????????####..............######\n??????????????????????????????????"
+}
+```
+
+Grid characters: `#` = wall/occupied, `.` = free space, `?` = unknown, `^`/`>`/`v`/`<` = car (heading arrow).
+
+---
+
+### POST /auto/configure
+
+Update safety thresholds and calibration values at runtime without restarting.
+
+**Request Body:**
+```json
+{
+  "collision_threshold_cm": 20,
+  "speed_calibration": 0.008
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `collision_threshold_cm` | float | 15 | Emergency stop distance (cm) |
+| `stuck_time_threshold` | float | 1.5 | Seconds of movement before stuck check |
+| `stuck_spread_threshold` | float | 2.0 | Min distance spread (cm) to not be stuck |
+| `speed_calibration` | float | 0.007 | cm per (PWM unit * second) |
+| `rotation_calibration` | float | 0.09 | degrees per (PWM unit * second) |
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "updated": {
+    "collision_threshold_cm": 20.0,
+    "speed_calibration": 0.008
+  }
+}
+```
+
+---
+
+### POST /auto/reset
+
+Reset occupancy grid and/or dead-reckoning pose for fresh exploration.
+
+**Request Body:**
+```json
+{
+  "reset_grid": true,
+  "reset_pose": true
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `reset_grid` | bool | true | Clear occupancy grid to all-unknown |
+| `reset_pose` | bool | true | Reset position to origin (0,0) facing north |
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "grid": "reset",
+  "pose": "reset",
+  "safety_flags": "cleared"
+}
+```
+
+---
+
 ## Dashboard
 
 ### GET /dashboard
@@ -583,18 +789,18 @@ The motor value signs for each mecanum direction (multiply by speed):
 
 | Direction | Front-Left | Rear-Left | Front-Right | Rear-Right |
 |-----------|-----------|-----------|-------------|------------|
-| forward | +1 | +1 | +1 | +1 |
-| backward | -1 | -1 | -1 | -1 |
-| left | -1 | -1 | +1 | +1 |
-| right | +1 | +1 | -1 | -1 |
-| strafe_left | -1 | +1 | +1 | -1 |
-| strafe_right | +1 | -1 | -1 | +1 |
-| rotate_cw | +1 | +1 | -1 | -1 |
-| rotate_ccw | -1 | -1 | +1 | +1 |
-| diagonal_fl | 0 | +1 | +1 | 0 |
-| diagonal_fr | +1 | 0 | 0 | +1 |
-| diagonal_bl | -1 | 0 | 0 | -1 |
-| diagonal_br | 0 | -1 | -1 | 0 |
+| forward | -1 | -1 | -1 | -1 |
+| backward | +1 | +1 | +1 | +1 |
+| left | +1 | +1 | -1 | -1 |
+| right | -1 | -1 | +1 | +1 |
+| strafe_left | +1 | -1 | -1 | +1 |
+| strafe_right | -1 | +1 | +1 | -1 |
+| rotate_cw | -1 | -1 | +1 | +1 |
+| rotate_ccw | +1 | +1 | -1 | -1 |
+| diagonal_fl | 0 | -1 | -1 | 0 |
+| diagonal_fr | -1 | 0 | 0 | -1 |
+| diagonal_bl | +1 | 0 | 0 | +1 |
+| diagonal_br | 0 | +1 | +1 | 0 |
 
 ---
 

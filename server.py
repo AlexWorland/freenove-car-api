@@ -37,6 +37,7 @@ _buzzer = None
 _buzzer_pwm = None
 _led_animation_thread = None
 _led_animation_stop = threading.Event()
+_autonomy = None
 
 # Track current servo positions for interpolation
 _servo_positions = {0: 90, 1: 90}
@@ -99,11 +100,27 @@ def get_buzzer():
     return _buzzer_pwm
 
 
+def get_autonomy():
+    """Return the singleton AutonomyModule, creating it on first call."""
+    global _autonomy
+    if _autonomy is None:
+        from autonomy import AutonomyModule
+        _autonomy = AutonomyModule(
+            get_motor_fn=get_motor,
+            get_servo_fn=get_servo,
+            get_ultrasonic_fn=get_ultrasonic,
+            get_infrared_fn=get_infrared,
+            get_adc_fn=get_adc,
+            move_servo_smooth_fn=move_servo_smooth,
+        )
+    return _autonomy
+
+
 def move_servo_smooth(channel, target_angle, speed=100):
     """Move servo to target angle with interpolation for speed control.
 
     Args:
-        channel: Servo channel (0=pan, 1=tilt)
+        channel: Servo channel (0=tilt/vertical, 1=pan/horizontal)
         target_angle: Target angle 0-180
         speed: Degrees per second (1-500). Higher = faster. 0 = instant.
     """
@@ -248,6 +265,13 @@ def index():
                 "GET /camera/stream": "Live MJPEG stream (?width=&height=&fps=)",
                 "POST /camera/sweep": "Pan+tilt sweep with photos {step, pan_min, pan_max, ...}",
             },
+            "autonomy": {
+                "POST /auto/step": "Decision cycle — move, scan, recover, or stop",
+                "POST /auto/scan": "Ultrasonic sweep → polar distance map + grid update",
+                "GET /auto/state": "Read-only state (pose, flags, optional grid)",
+                "POST /auto/configure": "Tune safety thresholds and calibration",
+                "POST /auto/reset": "Reset grid and/or pose",
+            },
             "calibration": {
                 "POST /calibrate": "Single direction calibration {direction, speed, duration}",
                 "POST /calibrate/all": "All mecanum directions {speed, duration}",
@@ -378,14 +402,14 @@ def control_motors():
         speed = data.get("speed", 1500)
         speed = max(0, min(speed, 4095))
         commands = {
-            "forward":  ( speed,  speed,  speed,  speed),
-            "backward": (-speed, -speed, -speed, -speed),
-            "left":     (-speed, -speed,  speed,  speed),
-            "right":    ( speed,  speed, -speed, -speed),
-            "strafe_left":  (-speed, speed, speed, -speed),
-            "strafe_right": ( speed, -speed, -speed, speed),
-            "rotate_cw":    ( speed, speed, -speed, -speed),
-            "rotate_ccw":   (-speed, -speed, speed, speed),
+            "forward":  (-speed, -speed, -speed, -speed),
+            "backward": ( speed,  speed,  speed,  speed),
+            "left":     ( speed,  speed, -speed, -speed),
+            "right":    (-speed, -speed,  speed,  speed),
+            "strafe_left":  ( speed, -speed, -speed,  speed),
+            "strafe_right": (-speed,  speed,  speed, -speed),
+            "rotate_cw":    (-speed, -speed,  speed,  speed),
+            "rotate_ccw":   ( speed,  speed, -speed, -speed),
             "stop":     (0, 0, 0, 0),
         }
         cmd = data["command"]
@@ -412,23 +436,24 @@ def control_servos():
     results = []
 
     # Object mode: {pan: 90, tilt: 120, speed: 100}
+    # Channel 0 = tilt (vertical), Channel 1 = pan (horizontal)
     if "pan" in data or "tilt" in data:
         if "pan" in data:
             angle = max(0, min(180, int(data["pan"])))
-            if speed > 0:
-                move_servo_smooth(0, angle, speed)
-            else:
-                servo.set_servo_pwm("0", angle)
-                _servo_positions[0] = angle
-            results.append({"channel": 0, "angle": angle})
-        if "tilt" in data:
-            angle = max(0, min(180, int(data["tilt"])))
             if speed > 0:
                 move_servo_smooth(1, angle, speed)
             else:
                 servo.set_servo_pwm("1", angle)
                 _servo_positions[1] = angle
             results.append({"channel": 1, "angle": angle})
+        if "tilt" in data:
+            angle = max(0, min(180, int(data["tilt"])))
+            if speed > 0:
+                move_servo_smooth(0, angle, speed)
+            else:
+                servo.set_servo_pwm("0", angle)
+                _servo_positions[0] = angle
+            results.append({"channel": 0, "angle": angle})
         return jsonify({"status": "ok", "servos": results, "speed": speed})
 
     # Array mode: [{channel: 0, angle: 90}, ...]
@@ -528,10 +553,10 @@ def control_batch():
                 if "command" in cmd:
                     speed = cmd.get("speed", 1500)
                     mapping = {
-                        "forward":  ( speed,  speed,  speed,  speed),
-                        "backward": (-speed, -speed, -speed, -speed),
-                        "left":     (-speed, -speed,  speed,  speed),
-                        "right":    ( speed,  speed, -speed, -speed),
+                        "forward":  (-speed, -speed, -speed, -speed),
+                        "backward": ( speed,  speed,  speed,  speed),
+                        "left":     ( speed,  speed, -speed, -speed),
+                        "right":    (-speed, -speed,  speed,  speed),
                         "stop":     (0, 0, 0, 0),
                     }
                     vals = mapping.get(cmd["command"], (0, 0, 0, 0))
@@ -595,24 +620,130 @@ def control_stop():
     except Exception as e:
         stopped.append(f"buzzer (error: {e})")
 
+    try:
+        if _autonomy is not None:
+            _autonomy.safety.stop_monitoring()
+            _autonomy.safety.collision_flag = False
+            _autonomy.safety.stuck_flag = False
+            stopped.append("autonomy safety")
+    except Exception as e:
+        stopped.append(f"autonomy safety (error: {e})")
+
     return jsonify({"status": "ok", "stopped": stopped})
+
+
+# ---- Autonomy --------------------------------------------------------------
+
+@app.route("/auto/step", methods=["POST"])
+def auto_step():
+    """Core autonomy decision cycle — move, scan, recover, or stop."""
+    data = request.get_json(force=True) if request.is_json else {}
+    auto = get_autonomy()
+
+    action = data.get("action")
+    command = data.get("command")
+    speed = data.get("speed", 1500)
+    duration = data.get("duration", 0.5)
+    scan_params = data.get("scan_params")
+    recover_maneuver = data.get("recover_maneuver")
+
+    result = auto.execute_step(
+        command=command,
+        speed=speed,
+        duration=duration,
+        action=action,
+        scan_params=scan_params,
+        recover_maneuver=recover_maneuver,
+    )
+
+    return jsonify(result)
+
+
+@app.route("/auto/scan", methods=["POST"])
+def auto_scan():
+    """Full ultrasonic sweep — returns polar distance map and updates grid."""
+    data = request.get_json(force=True) if request.is_json else {}
+    auto = get_autonomy()
+
+    pan_min = data.get("pan_min", 30)
+    pan_max = data.get("pan_max", 150)
+    step = data.get("step", 5)
+    settle_ms = data.get("settle_ms", 150)
+
+    result = auto.perform_scan(
+        pan_min=pan_min,
+        pan_max=pan_max,
+        step=step,
+        settle_ms=settle_ms,
+    )
+
+    return jsonify(result)
+
+
+@app.route("/auto/state")
+def auto_state():
+    """Read-only state: pose, safety flags, optional occupancy grid."""
+    auto = get_autonomy()
+    include_grid = request.args.get("include_grid", "false").lower() in ("true", "1", "yes")
+    grid_radius = request.args.get("grid_radius", 20, type=int)
+    grid_radius = max(5, min(50, grid_radius))
+
+    return jsonify(auto.get_state(
+        include_grid=include_grid,
+        grid_radius=grid_radius,
+    ))
+
+
+@app.route("/auto/configure", methods=["POST"])
+def auto_configure():
+    """Tune safety thresholds and calibration values at runtime."""
+    data = request.get_json(force=True) if request.is_json else {}
+    auto = get_autonomy()
+
+    updated = auto.configure(**data)
+
+    if not updated:
+        return jsonify({
+            "status": "no_change",
+            "valid_keys": [
+                "collision_threshold_cm", "stuck_time_threshold",
+                "stuck_spread_threshold", "speed_calibration",
+                "rotation_calibration",
+            ],
+        })
+
+    return jsonify({"status": "ok", "updated": updated})
+
+
+@app.route("/auto/reset", methods=["POST"])
+def auto_reset():
+    """Reset occupancy grid and/or pose for fresh exploration."""
+    data = request.get_json(force=True) if request.is_json else {}
+    auto = get_autonomy()
+
+    reset_grid = data.get("reset_grid", True)
+    reset_pose = data.get("reset_pose", True)
+
+    result = auto.reset(reset_grid=reset_grid, reset_pose=reset_pose)
+
+    return jsonify({"status": "ok", **result})
 
 
 # ---- Calibration -----------------------------------------------------------
 
 MECANUM_DIRECTIONS = {
-    "forward":      ( 1,  1,  1,  1),
-    "backward":     (-1, -1, -1, -1),
-    "left":         (-1, -1,  1,  1),
-    "right":        ( 1,  1, -1, -1),
-    "strafe_left":  (-1,  1,  1, -1),
-    "strafe_right": ( 1, -1, -1,  1),
-    "rotate_cw":    ( 1,  1, -1, -1),
-    "rotate_ccw":   (-1, -1,  1,  1),
-    "diagonal_fl":  ( 0,  1,  1,  0),
-    "diagonal_fr":  ( 1,  0,  0,  1),
-    "diagonal_bl":  (-1,  0,  0, -1),
-    "diagonal_br":  ( 0, -1, -1,  0),
+    "forward":      (-1, -1, -1, -1),
+    "backward":     ( 1,  1,  1,  1),
+    "left":         ( 1,  1, -1, -1),
+    "right":        (-1, -1,  1,  1),
+    "strafe_left":  ( 1, -1, -1,  1),
+    "strafe_right": (-1,  1,  1, -1),
+    "rotate_cw":    (-1, -1,  1,  1),
+    "rotate_ccw":   ( 1,  1, -1, -1),
+    "diagonal_fl":  ( 0, -1, -1,  0),
+    "diagonal_fr":  (-1,  0,  0, -1),
+    "diagonal_bl":  ( 1,  0,  0,  1),
+    "diagonal_br":  ( 0,  1,  1,  0),
 }
 
 
@@ -732,14 +863,14 @@ def camera_sweep():
     pan_positions = list(range(pan_min, pan_max + 1, step))
 
     for row_idx, tilt in enumerate(tilt_positions):
-        servo.set_servo_pwm("1", tilt)
+        servo.set_servo_pwm("0", tilt)
         time.sleep(settle)
 
         # Serpentine: reverse pan direction on odd rows
         row_pans = pan_positions if row_idx % 2 == 0 else list(reversed(pan_positions))
 
         for pan in row_pans:
-            servo.set_servo_pwm("0", pan)
+            servo.set_servo_pwm("1", pan)
             time.sleep(settle)
 
             img = _capture_jpeg(width, height)
@@ -749,9 +880,9 @@ def camera_sweep():
                 "image": base64.b64encode(img).decode() if img else None,
             })
 
-    # Return servos to center
-    servo.set_servo_pwm("0", 90)
-    servo.set_servo_pwm("1", 90)
+    # Return servos to center (ch0=tilt, ch1=pan)
+    servo.set_servo_pwm("0", 90)  # tilt center
+    servo.set_servo_pwm("1", 90)  # pan center
     _servo_positions[0] = 90
     _servo_positions[1] = 90
 
