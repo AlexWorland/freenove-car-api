@@ -297,7 +297,7 @@ SHOULD point straight ahead, but manufacturing variance means the true center is
 The car performed:
 1. A coarse ultrasonic sweep (30°-150° in 10° steps) with a camera image at each angle
 2. A fine ultrasonic sweep (1° steps around the coarse minimum) with camera images every 5°
-3. Four seed movements (forward, backward, strafe_left, strafe_right) at speed=1500 for 0.5s each,
+3. Four seed movements (forward, backward, strafe_left, strafe_right) at speed=700 for 0.5s each,
    capturing before/after camera images, ultrasonic distances, IR readings, and sensor fusion results
 
 The Pi's algorithm found the minimum ultrasonic distance and assumed perpendicular-to-wall = straight ahead.
@@ -705,9 +705,9 @@ def control_motors():
     data = request.get_json(force=True)
     motor = get_motor()
 
-    # Named command mode: {command: "forward", speed: 1500}
+    # Named command mode: {command: "forward", speed: 700}
     if "command" in data:
-        speed = data.get("speed", 1500)
+        speed = data.get("speed", 700)
         speed = max(0, min(speed, 4095))
         commands = {
             "forward":  (-speed, -speed, -speed, -speed),
@@ -863,7 +863,7 @@ def control_batch():
             if cmd_type == "motor":
                 motor = get_motor()
                 if "command" in cmd:
-                    speed = cmd.get("speed", 1500)
+                    speed = cmd.get("speed", 700)
                     mapping = {
                         "forward":  (-speed, -speed, -speed, -speed),
                         "backward": ( speed,  speed,  speed,  speed),
@@ -954,7 +954,7 @@ def auto_step():
 
     action = data.get("action")
     command = data.get("command")
-    speed = data.get("speed", 500)
+    speed = data.get("speed", 700)
     duration = data.get("duration", 0.5)
     scan_params = data.get("scan_params")
     recover_maneuver = data.get("recover_maneuver")
@@ -1089,7 +1089,7 @@ def auto_calibrate():
     seed_commands = ['forward', 'backward', 'strafe_left', 'strafe_right']
     seed_results = []
     for cmd in seed_commands:
-        step = auto.execute_step(command=cmd, speed=1500, duration=0.5)
+        step = auto.execute_step(command=cmd, speed=700, duration=0.5)
         seed_results.append(step)
         time.sleep(0.5)
 
@@ -1349,7 +1349,7 @@ def calibrate_single():
     """Calibrate one direction: capture before/after images around a timed move."""
     data = request.get_json(force=True)
     direction = data.get("direction", "forward")
-    speed = max(500, min(4095, data.get("speed", 1500)))
+    speed = max(500, min(4095, data.get("speed", 700)))
     duration = max(0.2, min(10.0, data.get("duration", 1.0)))
 
     if direction not in MECANUM_DIRECTIONS:
@@ -1366,7 +1366,7 @@ def calibrate_single():
 def calibrate_all():
     """Run calibration for all mecanum directions sequentially."""
     data = request.get_json(force=True) if request.is_json else {}
-    speed = max(500, min(4095, data.get("speed", 1500)))
+    speed = max(500, min(4095, data.get("speed", 700)))
     duration = max(0.2, min(10.0, data.get("duration", 1.0)))
     pause = max(0.5, min(5.0, data.get("pause", 1.5)))
     directions = data.get("directions", list(MECANUM_DIRECTIONS.keys()))
@@ -1407,7 +1407,7 @@ def calibrate_v2():
     img_height = max(64, min(480, data.get('image_height', 120)))
 
     # Movement parameters
-    speed = max(500, min(4095, data.get('speed', 1500)))
+    speed = max(500, min(4095, data.get('speed', 700)))
     duration = max(0.2, min(5.0, data.get('duration', 0.5)))
     pause = max(0.2, min(3.0, data.get('pause', 0.5)))
 
@@ -1734,8 +1734,8 @@ h2{font-size:0.95rem;color:#0ff;margin-bottom:8px;border-bottom:1px solid #333;p
 <h2>Motors</h2>
 <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
 <label style="font-size:0.8rem;color:#888">Speed:</label>
-<input type="range" id="motor-speed" min="500" max="4095" value="1500" style="flex:1;accent-color:#0ff">
-<span id="motor-speed-val" style="font-size:0.85rem;width:40px;text-align:right">1500</span>
+<input type="range" id="motor-speed" min="500" max="4095" value="700" style="flex:1;accent-color:#0ff">
+<span id="motor-speed-val" style="font-size:0.85rem;width:40px;text-align:right">700</span>
 </div>
 <div class="dpad">
   <button onclick="mc('diagonal_fl')">&#8598;FL</button>
