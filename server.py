@@ -119,13 +119,25 @@ def get_autonomy():
     return _autonomy
 
 
-def move_servo_smooth(channel, target_angle, speed=100):
+def release_servo(channel):
+    """Stop PWM output on a servo channel to eliminate jitter.
+
+    The servo will no longer actively hold position, but the trembling stops.
+    """
+    servo = get_servo()
+    pca_channel = servo.pwm_channel_map[str(channel)]
+    servo.pwm_servo.set_pwm(pca_channel, 0, 0)
+
+
+def move_servo_smooth(channel, target_angle, speed=100, release=False):
     """Move servo to target angle with interpolation for speed control.
 
     Args:
         channel: Servo channel (0=tilt/vertical, 1=pan/horizontal)
         target_angle: Target angle 0-180
         speed: Degrees per second (1-500). Higher = faster. 0 = instant.
+        release: If True, cut PWM after reaching target to stop jitter.
+                 Servo will not actively hold position.
     """
     servo = get_servo()
     ch_str = str(channel)
@@ -134,6 +146,9 @@ def move_servo_smooth(channel, target_angle, speed=100):
     if speed <= 0 or speed >= 500:
         servo.set_servo_pwm(ch_str, target_angle)
         _servo_positions[channel] = target_angle
+        if release:
+            time.sleep(0.2)
+            release_servo(channel)
         return
 
     current = _servo_positions.get(channel, 90)
@@ -145,6 +160,10 @@ def move_servo_smooth(channel, target_angle, speed=100):
         time.sleep(step_delay)
 
     _servo_positions[channel] = target_angle
+
+    if release:
+        time.sleep(0.2)
+        release_servo(channel)
 
 
 # ---------------------------------------------------------------------------
@@ -741,28 +760,35 @@ def control_servos():
     data = request.get_json(force=True)
     servo = get_servo()
     speed = data.get("speed", 0)  # deg/sec, 0 = instant
+    release = data.get("release", False)  # cut PWM after reaching target
     results = []
 
-    # Object mode: {pan: 90, tilt: 120, speed: 100}
+    # Object mode: {pan: 90, tilt: 120, speed: 100, release: true}
     # Channel 0 = tilt (vertical), Channel 1 = pan (horizontal)
     if "pan" in data or "tilt" in data:
         if "pan" in data:
             angle = max(0, min(180, int(data["pan"])))
             if speed > 0:
-                move_servo_smooth(1, angle, speed)
+                move_servo_smooth(1, angle, speed, release=release)
             else:
                 servo.set_servo_pwm("1", angle)
                 _servo_positions[1] = angle
+                if release:
+                    time.sleep(0.2)
+                    release_servo(1)
             results.append({"channel": 1, "angle": angle})
         if "tilt" in data:
             angle = max(0, min(180, int(data["tilt"])))
             if speed > 0:
-                move_servo_smooth(0, angle, speed)
+                move_servo_smooth(0, angle, speed, release=release)
             else:
                 servo.set_servo_pwm("0", angle)
                 _servo_positions[0] = angle
+                if release:
+                    time.sleep(0.2)
+                    release_servo(0)
             results.append({"channel": 0, "angle": angle})
-        return jsonify({"status": "ok", "servos": results, "speed": speed})
+        return jsonify({"status": "ok", "servos": results, "speed": speed, "released": release})
 
     # Array mode: [{channel: 0, angle: 90}, ...]
     if isinstance(data, list):
@@ -779,6 +805,17 @@ def control_servos():
         return jsonify({"status": "ok", "servos": results})
 
     return jsonify({"error": "Provide {pan, tilt} or [{channel, angle}, ...]"}), 400
+
+
+@app.route("/control/servos/release", methods=["POST"])
+def control_servos_release():
+    """Cut PWM output to all servo channels, stopping jitter.
+
+    Servos will no longer hold position but will stop trembling.
+    """
+    release_servo(0)  # tilt
+    release_servo(1)  # pan
+    return jsonify({"status": "ok", "released": [0, 1]})
 
 
 @app.route("/control/leds", methods=["POST"])
