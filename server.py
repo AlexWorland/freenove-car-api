@@ -412,6 +412,132 @@ for debugging calibration issues.
 """.strip()
 
 
+CALIBRATION_V2_PROMPT = """
+<context>
+You are analyzing v2 calibration data from a Freenove 4WD Smart Car with mecanum wheels.
+The car has an ultrasonic distance sensor and camera mounted on a pan/tilt servo head,
+3 IR line-tracking sensors underneath, photoresistors (left/right), and a battery.
+
+The car performed a comprehensive sweep-move-sweep calibration sequence:
+1. Initial baseline sweep (no movement)
+2. Forward movement then sweep
+3. Backward movement then sweep
+4. Strafe left movement then sweep
+5. Strafe right movement then sweep
+
+Each sweep consists of:
+- Horizontal sweep: pan servo across range with tilt at 90 degrees (level)
+- Vertical sweep: tilt servo across range with pan at 90 degrees (center)
+
+At each position: camera image (base64 JPEG), ultrasonic distance (cm), IR sensors
+(left/middle/right, 0=no line 1=line), photoresistors (left/right voltage), battery voltage.
+
+Each sweep entry includes:
+- label: identifies the sweep stage (e.g. "initial", "after_forward")
+- preceded_by: the movement command that occurred before this sweep (null for initial)
+- movement: details of the preceding movement (command, speed, duration, motor values, timestamp)
+- timestamp: ISO 8601 UTC time when the sweep began
+</context>
+
+<task>
+Analyze the sweep data to understand the car's environment and movement behavior,
+then POST corrections to /auto/calibrate/correct on the same host.
+</task>
+
+<step_1_baseline_environment>
+Examine the initial sweep (label="initial"). The horizontal sweep shows the scene
+left-to-right; the vertical sweep shows floor-to-ceiling.
+
+For each position, correlate the camera image with ultrasonic distance:
+- Identify walls, obstacles, open space, and surface types
+- Note which directions have reliable flat surfaces for calibration reference
+- Identify objects that could produce misleading ultrasonic readings
+  (soft furnishings absorb sound, narrow objects give inconsistent returns,
+  angled surfaces deflect rather than reflect)
+- Check photoresistor values for lighting conditions and asymmetry
+- Check IR sensors for floor surface (line detection)
+</step_1_baseline_environment>
+
+<step_2_movement_analysis>
+For each movement (forward, backward, strafe_left, strafe_right), compare
+the post-movement sweep against the initial baseline:
+
+- Ultrasonic distance changes across all pan angles reveal actual displacement direction
+- Camera image shifts reveal visual displacement
+- Asymmetric distance changes reveal drift and rotation
+- IR sensor changes reveal if the car crossed any floor markings
+- Battery voltage drop during sequence reveals power draw under load
+
+For each movement, determine:
+1. Did it move in the expected direction? (e.g. forward should decrease distance at pan=90)
+2. How much lateral drift occurred? (unexpected distance changes at side angles)
+3. How much unwanted rotation occurred? (asymmetric left/right changes)
+4. Was the distance traveled proportional to commanded speed x duration?
+</step_2_movement_analysis>
+
+<step_3_servo_alignment>
+The horizontal sweep provides pan angle to ultrasonic distance at each step.
+The minimum distance angle in the initial sweep indicates perpendicular to nearest wall.
+
+If a flat wall is visible in the images:
+- The perpendicular angle = true forward direction
+- pan_offset_deg = (perpendicular_angle - 90)
+
+Cross-reference with the vertical sweep: if tilt=90 degrees shows floor rather than
+straight ahead, the tilt servo may also need offset correction.
+
+Validate with post-movement sweeps: after forward movement, distance at the
+perpendicular angle should decrease. If a different angle shows the largest decrease,
+the true forward direction may differ from the ultrasonic minimum.
+</step_3_servo_alignment>
+
+<step_4_compute_corrections>
+Based on your analysis, determine:
+
+1. pan_offset_deg (required): Corrected servo center offset from 90 degrees.
+   Use the perpendicular angle from horizontal sweep, validated by movement consistency.
+
+2. motor_biases (optional): Per-command corrections from movement analysis.
+   Each bias has:
+   - lateral: cm/sec drift (positive = left). Counter observed drift.
+   - rotation: deg/sec unwanted rotation (positive = CCW). Counter observed rotation.
+   - speed_scale: actual/commanded speed ratio. Usually 0.8-1.0.
+   Only include for commands with clear systematic drift evidence.
+
+3. speed_calibration_factor (optional): cm per (PWM x second). Default 0.007.
+   Adjust if movements consistently over/under-shoot expected distances.
+
+4. rotation_calibration_factor (optional): deg per (PWM x second). Default 0.09.
+   Adjust if rotation commands show systematic over/under-rotation.
+</step_4_compute_corrections>
+
+<output_format>
+POST corrections as JSON to /auto/calibrate/correct:
+
+{
+  "pan_offset_deg": <float, required>,
+  "servo_slop_deg": <float, optional>,
+  "motor_biases": {
+    "<command>": {"lateral": <float>, "rotation": <float>, "speed_scale": <float>},
+    ...
+  },
+  "speed_calibration_factor": <float, optional>,
+  "rotation_calibration_factor": <float, optional>,
+  "notes": "<reasoning: what images showed, why this offset, confidence level>"
+}
+</output_format>
+
+<constraints>
+- pan_offset_deg is required. All other fields optional.
+- Only include motor_biases for commands with clear systematic drift evidence.
+- Compare each movement's sweep against the initial baseline, not against each other.
+- The initial sweep is the ground truth for the environment.
+- Conservative corrections preferred: small accurate offsets beat large uncertain ones.
+- Include detailed notes explaining which sweep positions informed each decision.
+</constraints>
+""".strip()
+
+
 # ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
@@ -456,6 +582,7 @@ def index():
             "calibration": {
                 "POST /calibrate": "Single direction calibration {direction, speed, duration}",
                 "POST /calibrate/all": "All mecanum directions {speed, duration}",
+                "POST /calibrate/v2": "Sweep-move-sweep with full sensor collection at each position",
             },
             "system": {
                 "POST /execute": "Run Python code {code: '...'}",
@@ -1074,6 +1201,95 @@ MECANUM_DIRECTIONS = {
 }
 
 
+def _collect_all_sensors():
+    """Read ultrasonic, infrared, and ADC sensors in one call."""
+    result = {}
+
+    try:
+        result['ultrasonic_cm'] = get_ultrasonic().get_distance()
+    except Exception:
+        result['ultrasonic_cm'] = None
+
+    try:
+        ir = get_infrared()
+        result['infrared'] = {
+            'left': ir.read_one_infrared(1),
+            'middle': ir.read_one_infrared(2),
+            'right': ir.read_one_infrared(3),
+        }
+    except Exception:
+        result['infrared'] = None
+
+    try:
+        adc = get_adc()
+        raw_power = adc.read_adc(2)
+        multiplier = 3 if adc.pcb_version == 1 else 2
+        result['adc'] = {
+            'left_photoresistor_v': adc.read_adc(0),
+            'right_photoresistor_v': adc.read_adc(1),
+            'battery_voltage': round(raw_power * multiplier, 2),
+        }
+    except Exception:
+        result['adc'] = None
+
+    return result
+
+
+def _perform_calibration_sweep(pan_min, pan_max, pan_step,
+                               tilt_min, tilt_max, tilt_step,
+                               settle, img_width, img_height):
+    """Perform horizontal and vertical sweeps collecting all sensor data.
+
+    Horizontal sweep: pan across pan_min..pan_max with tilt held at 90 (level).
+    Vertical sweep: tilt across tilt_min..tilt_max with pan held at 90 (center).
+
+    At each position captures: camera image, ultrasonic, IR, and ADC.
+    """
+    horizontal = []
+    # Horizontal sweep: tilt level, pan across range
+    move_servo_smooth(0, 90, 200)
+    time.sleep(settle)
+
+    for pan in range(pan_min, pan_max + 1, pan_step):
+        move_servo_smooth(1, pan, 200)
+        time.sleep(settle)
+
+        sensors = _collect_all_sensors()
+        img = _capture_jpeg(img_width, img_height)
+
+        horizontal.append({
+            'pan': pan,
+            'tilt': 90,
+            'image': base64.b64encode(img).decode() if img else None,
+            **sensors,
+        })
+
+    vertical = []
+    # Vertical sweep: pan center, tilt across range
+    move_servo_smooth(1, 90, 200)
+    time.sleep(settle)
+
+    for tilt in range(tilt_min, tilt_max + 1, tilt_step):
+        move_servo_smooth(0, tilt, 200)
+        time.sleep(settle)
+
+        sensors = _collect_all_sensors()
+        img = _capture_jpeg(img_width, img_height)
+
+        vertical.append({
+            'pan': 90,
+            'tilt': tilt,
+            'image': base64.b64encode(img).decode() if img else None,
+            **sensors,
+        })
+
+    # Return to center
+    move_servo_smooth(0, 90, 200)
+    move_servo_smooth(1, 90, 200)
+
+    return {'horizontal': horizontal, 'vertical': vertical}
+
+
 def _capture_jpeg(width=320, height=240):
     """Capture a JPEG and return raw bytes."""
     result = subprocess.run(
@@ -1165,6 +1381,99 @@ def calibrate_all():
         time.sleep(pause)
 
     return jsonify({"status": "ok", "calibration": results})
+
+
+@app.route("/calibrate/v2", methods=["POST"])
+def calibrate_v2():
+    """V2 calibration: sweep-move-sweep sequence with full sensor collection.
+
+    Performs horizontal and vertical servo sweeps at each stage, collecting
+    camera images, ultrasonic distance, IR, and ADC readings at every position.
+
+    Sequence: initial sweep -> forward -> sweep -> backward -> sweep ->
+              strafe_left -> sweep -> strafe_right -> sweep
+    """
+    data = request.get_json(force=True) if request.is_json else {}
+
+    # Sweep parameters
+    pan_min = max(0, min(180, data.get('pan_min', 30)))
+    pan_max = max(0, min(180, data.get('pan_max', 150)))
+    pan_step = max(5, min(45, data.get('pan_step', 15)))
+    tilt_min = max(0, min(180, data.get('tilt_min', 60)))
+    tilt_max = max(0, min(180, data.get('tilt_max', 120)))
+    tilt_step = max(5, min(45, data.get('tilt_step', 15)))
+    settle = max(0.05, min(2.0, data.get('settle', 0.2)))
+    img_width = max(64, min(640, data.get('image_width', 160)))
+    img_height = max(64, min(480, data.get('image_height', 120)))
+
+    # Movement parameters
+    speed = max(500, min(4095, data.get('speed', 1500)))
+    duration = max(0.2, min(5.0, data.get('duration', 0.5)))
+    pause = max(0.2, min(3.0, data.get('pause', 0.5)))
+
+    motor = get_motor()
+    started_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+    sweep_args = (pan_min, pan_max, pan_step, tilt_min, tilt_max, tilt_step,
+                  settle, img_width, img_height)
+
+    sweeps = []
+
+    # Initial sweep (baseline, no movement)
+    sweeps.append({
+        'label': 'initial',
+        'preceded_by': None,
+        'movement': None,
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        **_perform_calibration_sweep(*sweep_args),
+    })
+
+    # Movement + sweep sequence
+    movements = ['forward', 'backward', 'strafe_left', 'strafe_right']
+    for cmd in movements:
+        multipliers = MECANUM_DIRECTIONS[cmd]
+        motor_vals = tuple(int(m * speed) for m in multipliers)
+
+        move_timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        motor.set_motor_model(*motor_vals)
+        time.sleep(duration)
+        motor.set_motor_model(0, 0, 0, 0)
+        time.sleep(pause)
+
+        sweeps.append({
+            'label': f'after_{cmd}',
+            'preceded_by': cmd,
+            'movement': {
+                'command': cmd,
+                'speed': speed,
+                'duration': duration,
+                'motor_values': motor_vals,
+                'timestamp': move_timestamp,
+            },
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            **_perform_calibration_sweep(*sweep_args),
+        })
+
+    completed_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+    return jsonify({
+        'status': 'ok',
+        'started_at': started_at,
+        'completed_at': completed_at,
+        'parameters': {
+            'pan_range': [pan_min, pan_max],
+            'pan_step': pan_step,
+            'tilt_range': [tilt_min, tilt_max],
+            'tilt_step': tilt_step,
+            'settle_sec': settle,
+            'image_resolution': [img_width, img_height],
+            'move_speed': speed,
+            'move_duration': duration,
+            'move_pause': pause,
+        },
+        'analysis_prompt': CALIBRATION_V2_PROMPT,
+        'sweeps': sweeps,
+    })
 
 
 # ---- Camera Sweep ----------------------------------------------------------
