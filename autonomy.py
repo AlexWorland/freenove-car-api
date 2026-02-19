@@ -19,6 +19,11 @@ import math
 import threading
 import time
 
+from calibration import (
+    VisualOdometry, UltrasonicReference, MotorBiasTable,
+    ServoAlignment, SensorFusion,
+)
+
 
 # ---------------------------------------------------------------------------
 # OccupancyGrid — 200x200 cells, 5cm resolution = 10m x 10m
@@ -417,17 +422,30 @@ class AutonomyModule:
     }
 
     def __init__(self, get_motor_fn, get_servo_fn, get_ultrasonic_fn,
-                 get_infrared_fn, get_adc_fn, move_servo_smooth_fn):
+                 get_infrared_fn, get_adc_fn, move_servo_smooth_fn,
+                 get_camera_fn=None):
         self._get_motor = get_motor_fn
         self._get_servo = get_servo_fn
         self._get_ultrasonic = get_ultrasonic_fn
         self._get_infrared = get_infrared_fn
         self._get_adc = get_adc_fn
         self._move_servo_smooth = move_servo_smooth_fn
+        self._get_camera = get_camera_fn  # returns JPEG bytes or None
 
         self.grid = OccupancyGrid()
         self.pose = PoseTracker()
         self.safety = SafetyMonitor(get_ultrasonic_fn, get_motor_fn)
+
+        # Calibration components
+        self.visual_odom = VisualOdometry()
+        self.ultrasonic_ref = UltrasonicReference(
+            get_ultrasonic_fn, get_servo_fn, move_servo_smooth_fn
+        )
+        self.bias_table = MotorBiasTable()
+        self.servo_align = ServoAlignment(get_ultrasonic_fn, move_servo_smooth_fn)
+        self.fusion = SensorFusion()
+
+        self._correction_enabled = True  # can be toggled via configure()
 
         self._movement_lock = threading.Lock()
 
@@ -577,13 +595,33 @@ class AutonomyModule:
             ir_data = self._read_infrared()
             battery = self._read_battery()
 
+            # Pre-movement calibration captures
+            if self._correction_enabled:
+                if self._get_camera:
+                    try:
+                        before_jpeg = self._get_camera()
+                        self.visual_odom.capture_before(before_jpeg)
+                    except Exception:
+                        pass
+                self.ultrasonic_ref.capture_before()
+                self.bias_table.check_battery_staleness(battery)
+
+            # Apply motor bias correction
+            correction = (0, 0, 0, 0)
+            if self._correction_enabled:
+                correction = self.bias_table.compute_motor_correction(command, speed)
+
             # Start safety monitor
             self.safety.start_monitoring(command)
 
-            # Execute movement
+            # Execute movement with bias-corrected motors
             multipliers = self.COMMANDS[command]
-            motor_vals = tuple(int(m * speed) for m in multipliers)
-            self._get_motor().set_motor_model(*motor_vals)
+            base_vals = tuple(int(m * speed) for m in multipliers)
+            corrected_vals = tuple(
+                max(-4095, min(4095, b + c))
+                for b, c in zip(base_vals, correction)
+            )
+            self._get_motor().set_motor_model(*corrected_vals)
 
             # Wait for duration or safety interrupt
             start = time.time()
@@ -602,11 +640,76 @@ class AutonomyModule:
             # Post-movement sensors
             post_distance = self._read_distance()
 
-            # Update dead reckoning (skip if collision stopped us early)
-            if not self.safety.collision_flag:
-                self.pose.update_from_movement(command, speed, actual_duration)
+            # Post-movement calibration captures and fusion
+            fusion_result = None
+            if self._correction_enabled and not self.safety.collision_flag:
+                # Visual odometry
+                visual_est = {'dx_cm': 0, 'dy_cm': 0, 'd_theta_deg': 0, 'confidence': 0}
+                if self._get_camera:
+                    try:
+                        after_jpeg = self._get_camera()
+                        visual_est = self.visual_odom.compute_displacement(
+                            after_jpeg, distance_cm=max(pre_distance, 10)
+                        )
+                    except Exception:
+                        pass
 
-            return {
+                # Ultrasonic reference
+                self.ultrasonic_ref.capture_after()
+                ultra_est = self.ultrasonic_ref.compute_correction()
+
+                # Dead reckoning estimate
+                dr_dist = speed * self.pose.SPEED_CALIBRATION_FACTOR * actual_duration
+                dr_heading = self.pose.heading_deg
+                dr_est = {
+                    'dx_cm': 0,
+                    'dy_cm': 0,
+                    'd_theta_deg': 0,
+                    'confidence': 1.0,
+                }
+                # Compute dead reckoning based on command type
+                if command in ('forward', 'backward'):
+                    sign = 1 if command == 'forward' else -1
+                    dr_est['dx_cm'] = sign * dr_dist
+                elif command in ('strafe_left', 'strafe_right'):
+                    sign = 1 if command == 'strafe_left' else -1
+                    dr_est['dy_cm'] = sign * dr_dist
+                elif command in ('rotate_cw', 'rotate_ccw'):
+                    rot = speed * self.pose.ROTATION_CALIBRATION_FACTOR * actual_duration
+                    sign = -1 if command == 'rotate_cw' else 1
+                    dr_est['d_theta_deg'] = sign * rot
+
+                # Fuse all three
+                fusion_result = self.fusion.fuse(visual_est, ultra_est, dr_est)
+
+                # Update pose with fused estimate instead of pure dead reckoning
+                with self.pose._lock:
+                    rad = math.radians(self.pose.heading_deg)
+                    self.pose.x_cm += (fusion_result['dx_cm'] * math.cos(rad)
+                                      - fusion_result['dy_cm'] * math.sin(rad))
+                    self.pose.y_cm += (fusion_result['dx_cm'] * math.sin(rad)
+                                      + fusion_result['dy_cm'] * math.cos(rad))
+                    self.pose.heading_deg = (self.pose.heading_deg
+                                            + fusion_result['d_theta_deg']) % 360
+
+                # Update motor bias table with observed errors
+                if actual_duration > 0.1 and command not in ('stop',):
+                    observed_lateral = fusion_result['dy_cm'] / actual_duration
+                    observed_rotation = fusion_result['d_theta_deg'] / actual_duration
+                    actual_speed_cm = fusion_result['dx_cm'] / actual_duration if actual_duration > 0 else 0
+                    self.bias_table.update(
+                        command, observed_lateral, observed_rotation,
+                        speed * self.pose.SPEED_CALIBRATION_FACTOR, actual_speed_cm,
+                        actual_duration,
+                    )
+                    self.bias_table.save()
+
+            else:
+                # No correction — use pure dead reckoning (original behavior)
+                if not self.safety.collision_flag:
+                    self.pose.update_from_movement(command, speed, actual_duration)
+
+            result = {
                 'command': command,
                 'speed': speed,
                 'requested_duration': duration,
@@ -619,6 +722,13 @@ class AutonomyModule:
                 'stuck': self.safety.stuck_flag,
                 'pose': self.pose.get_pose(),
             }
+
+            if fusion_result:
+                result['fusion'] = fusion_result
+                result['calibration_warning'] = self.bias_table.calibration_warning
+                result['bias_stale'] = self.bias_table.stale
+
+            return result
 
         finally:
             self._movement_lock.release()
@@ -693,7 +803,8 @@ class AutonomyModule:
 
         Accepted keys:
             collision_threshold_cm, stuck_time_threshold,
-            stuck_spread_threshold, speed_calibration, rotation_calibration.
+            stuck_spread_threshold, speed_calibration, rotation_calibration,
+            correction_enabled.
 
         Returns:
             dict of parameters that were actually updated.
@@ -719,6 +830,10 @@ class AutonomyModule:
         if 'rotation_calibration' in kwargs:
             self.pose.ROTATION_CALIBRATION_FACTOR = float(kwargs['rotation_calibration'])
             updated['rotation_calibration'] = self.pose.ROTATION_CALIBRATION_FACTOR
+
+        if 'correction_enabled' in kwargs:
+            self._correction_enabled = bool(kwargs['correction_enabled'])
+            updated['correction_enabled'] = self._correction_enabled
 
         return updated
 

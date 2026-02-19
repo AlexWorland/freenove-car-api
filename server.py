@@ -114,6 +114,7 @@ def get_autonomy():
             get_infrared_fn=get_infrared,
             get_adc_fn=get_adc,
             move_servo_smooth_fn=move_servo_smooth,
+            get_camera_fn=_capture_jpeg,
         )
     return _autonomy
 
@@ -319,6 +320,7 @@ def index():
                 "GET /auto/state": "Read-only state (pose, flags, optional grid)",
                 "POST /auto/configure": "Tune safety thresholds and calibration",
                 "POST /auto/reset": "Reset grid and/or pose",
+                "POST /auto/calibrate": "Startup calibration — servo alignment + bias seeding (~30s)",
             },
             "calibration": {
                 "POST /calibrate": "Single direction calibration {direction, speed, duration}",
@@ -760,7 +762,7 @@ def auto_configure():
             "valid_keys": [
                 "collision_threshold_cm", "stuck_time_threshold",
                 "stuck_spread_threshold", "speed_calibration",
-                "rotation_calibration",
+                "rotation_calibration", "correction_enabled",
             ],
         })
 
@@ -779,6 +781,39 @@ def auto_reset():
     result = auto.reset(reset_grid=reset_grid, reset_pose=reset_pose)
 
     return jsonify({"status": "ok", **result})
+
+
+@app.route("/auto/calibrate", methods=["POST"])
+def auto_calibrate():
+    """Run startup calibration: servo alignment + bias table seeding.
+
+    This takes ~30 seconds. Run once per session or after battery swap.
+    """
+    auto = get_autonomy()
+
+    # Step 1: Servo alignment
+    servo_result = auto.servo_align.calibrate()
+
+    # Step 2: Seed bias table with short movements
+    seed_commands = ['forward', 'backward', 'strafe_left', 'strafe_right']
+    seed_results = []
+    for cmd in seed_commands:
+        step = auto.execute_step(command=cmd, speed=500, duration=0.5)
+        seed_results.append({
+            'command': cmd,
+            'fusion': step.get('fusion'),
+        })
+        time.sleep(0.5)
+
+    # Save bias table after seeding
+    auto.bias_table.save()
+
+    return jsonify({
+        'status': 'ok',
+        'servo_alignment': servo_result,
+        'bias_seed': seed_results,
+        'bias_table': auto.bias_table.table,
+    })
 
 
 # ---- Calibration -----------------------------------------------------------

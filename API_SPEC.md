@@ -622,9 +622,26 @@ Core decision cycle — one HTTP call per decision. Supports movement commands, 
   "battery_voltage": 7.52,
   "collision": false,
   "stuck": false,
-  "pose": {"x_cm": 0.0, "y_cm": 5.1, "heading_deg": 90.0}
+  "pose": {"x_cm": 0.0, "y_cm": 5.1, "heading_deg": 90.0},
+  "fusion": {
+    "dx_cm": 24.15,
+    "dy_cm": 0.08,
+    "d_theta_deg": 0.3,
+    "weights": {"visual": 0.45, "ultrasonic": 0.35, "dead_reckoning": 0.2},
+    "fused": true
+  },
+  "calibration_warning": false,
+  "bias_stale": false
 }
 ```
+
+When self-correction is enabled (default), movement responses include additional fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `fusion` | object | Fused displacement estimate combining visual odometry, ultrasonic reference, and dead reckoning with per-source weights |
+| `calibration_warning` | bool | True if any bias exceeds soft guardrails (rotation >8 deg/sec or speed scale <0.6 or >1.4) |
+| `bias_stale` | bool | True if battery voltage dropped >0.5V from calibration baseline |
 
 **Available commands:** `forward`, `backward`, `left`, `right`, `strafe_left`, `strafe_right`, `rotate_cw`, `rotate_ccw`, `diagonal_fl`, `diagonal_fr`, `diagonal_bl`, `diagonal_br`, `stop`
 
@@ -723,6 +740,7 @@ Update safety thresholds and calibration values at runtime without restarting.
 | `stuck_spread_threshold` | float | 2.0 | Min distance spread (cm) to not be stuck |
 | `speed_calibration` | float | 0.007 | cm per (PWM unit * second) |
 | `rotation_calibration` | float | 0.09 | degrees per (PWM unit * second) |
+| `correction_enabled` | bool | true | Enable/disable self-correction (sensor fusion + bias) |
 
 **Response:**
 ```json
@@ -763,6 +781,50 @@ Reset occupancy grid and/or dead-reckoning pose for fresh exploration.
   "safety_flags": "cleared"
 }
 ```
+
+---
+
+### POST /auto/calibrate
+
+Run startup calibration: servo alignment detection + motor bias table seeding. Takes ~30 seconds.
+
+**Request Body:** `{}` (empty JSON object)
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "servo_alignment": {
+    "status": "ok",
+    "pan_offset_deg": -2.0,
+    "servo_slop_deg": 3.0,
+    "true_center_angle": 88,
+    "wall_distance_cm": 62.3,
+    "coarse_sweep": {"30": 150.2, "40": 145.1, "50": 138.9},
+    "fine_sweep": {"60": 125.3, "61": 124.8, "62": 124.2}
+  },
+  "bias_seed": [
+    {"command": "forward", "fusion": {"dx_cm": 24.3, "dy_cm": 0.1, "d_theta_deg": 0.5, "weights": {"visual": 0.45, "ultrasonic": 0.35, "dead_reckoning": 0.2}, "fused": true}},
+    {"command": "backward", "fusion": {"dx_cm": -23.8, "dy_cm": -0.2, "d_theta_deg": -0.3, "weights": {"visual": 0.42, "ultrasonic": 0.38, "dead_reckoning": 0.2}, "fused": true}},
+    {"command": "strafe_left", "fusion": {"dx_cm": 0.2, "dy_cm": 24.1, "d_theta_deg": 0.1, "weights": {"visual": 0.48, "ultrasonic": 0.32, "dead_reckoning": 0.2}, "fused": true}},
+    {"command": "strafe_right", "fusion": {"dx_cm": -0.1, "dy_cm": -24.5, "d_theta_deg": -0.2, "weights": {"visual": 0.46, "ultrasonic": 0.34, "dead_reckoning": 0.2}, "fused": true}}
+  ],
+  "bias_table": {
+    "forward": {"lateral": 0.2, "rotation": 1.1, "speed_scale": 0.92},
+    "backward": {"lateral": -0.1, "rotation": -0.5, "speed_scale": 0.88},
+    "strafe_left": {"lateral": 0.0, "rotation": 0.3, "speed_scale": 0.95},
+    "strafe_right": {"lateral": 0.1, "rotation": -0.4, "speed_scale": 0.94}
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `servo_alignment` | object | Results from servo centering: offset from 90°, slop range, true center angle, and wall distance |
+| `bias_seed` | array | Fusion results from initial seed movements (forward, backward, strafe_left, strafe_right) |
+| `bias_table` | object | Learned motor correction factors for each command (lateral drift, rotation bias, speed scale) |
+
+> **When to run:** Once per session, or after battery swap. The car should be facing a wall within 200cm.
 
 ---
 
