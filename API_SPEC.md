@@ -411,6 +411,146 @@ Run calibration for all mecanum directions sequentially with pauses between each
 
 ---
 
+### POST /calibrate/v2
+
+Comprehensive sweep-move-sweep calibration sequence. At each stage, performs horizontal and vertical servo sweeps collecting camera images, ultrasonic distance, IR, and ADC readings at every position.
+
+**Sequence:**
+1. Initial baseline sweep (no movement)
+2. Forward → sweep
+3. Backward → sweep
+4. Strafe left → sweep
+5. Strafe right → sweep
+
+Each sweep consists of:
+- **Horizontal sweep:** pan servo across range with tilt held at 90° (level)
+- **Vertical sweep:** tilt servo across range with pan held at 90° (center)
+
+**Request Body:**
+```json
+{
+  "pan_min": 30, "pan_max": 150, "pan_step": 15,
+  "tilt_min": 60, "tilt_max": 120, "tilt_step": 15,
+  "settle": 0.2,
+  "image_width": 160, "image_height": 120,
+  "speed": 1500, "duration": 0.5, "pause": 0.5
+}
+```
+
+| Field | Type | Default | Range | Description |
+|-------|------|---------|-------|-------------|
+| `pan_min` | int | 30 | 0-180 | Horizontal sweep start angle |
+| `pan_max` | int | 150 | 0-180 | Horizontal sweep end angle |
+| `pan_step` | int | 15 | 5-45 | Degrees between horizontal stops |
+| `tilt_min` | int | 60 | 0-180 | Vertical sweep start angle |
+| `tilt_max` | int | 150 | 0-180 | Vertical sweep end angle |
+| `tilt_step` | int | 15 | 5-45 | Degrees between vertical stops |
+| `settle` | float | 0.2 | 0.05-2.0 | Servo settle time per position (seconds) |
+| `image_width` | int | 160 | 64-640 | Capture width in pixels |
+| `image_height` | int | 120 | 64-480 | Capture height in pixels |
+| `speed` | int | 1500 | 500-4095 | Motor PWM speed for movements |
+| `duration` | float | 0.5 | 0.2-5.0 | Movement duration (seconds) |
+| `pause` | float | 0.5 | 0.2-3.0 | Settle time after motor stop (seconds) |
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "started_at": "2026-02-19T01:29:46Z",
+  "completed_at": "2026-02-19T01:30:40Z",
+  "parameters": {
+    "pan_range": [30, 150],
+    "pan_step": 15,
+    "tilt_range": [60, 120],
+    "tilt_step": 15,
+    "settle_sec": 0.2,
+    "image_resolution": [160, 120],
+    "move_speed": 1500,
+    "move_duration": 0.5,
+    "move_pause": 0.5
+  },
+  "analysis_prompt": "<structured prompt for Claude correction — see below>",
+  "sweeps": [
+    {
+      "label": "initial",
+      "preceded_by": null,
+      "movement": null,
+      "timestamp": "2026-02-19T01:29:46Z",
+      "horizontal": [
+        {
+          "pan": 30, "tilt": 90,
+          "image": "<base64 JPEG>",
+          "ultrasonic_cm": 120.3,
+          "infrared": {"left": 0, "middle": 1, "right": 0},
+          "adc": {"left_photoresistor_v": 2.5, "right_photoresistor_v": 2.7, "battery_voltage": 7.8}
+        }
+      ],
+      "vertical": [
+        {
+          "pan": 90, "tilt": 60,
+          "image": "<base64 JPEG>",
+          "ultrasonic_cm": 85.1,
+          "infrared": {"left": 0, "middle": 1, "right": 0},
+          "adc": {"left_photoresistor_v": 2.5, "right_photoresistor_v": 2.7, "battery_voltage": 7.8}
+        }
+      ]
+    },
+    {
+      "label": "after_forward",
+      "preceded_by": "forward",
+      "movement": {
+        "command": "forward",
+        "speed": 1500,
+        "duration": 0.5,
+        "motor_values": [-1500, -1500, -1500, -1500],
+        "timestamp": "2026-02-19T01:29:57Z"
+      },
+      "timestamp": "2026-02-19T01:29:58Z",
+      "horizontal": ["..."],
+      "vertical": ["..."]
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `started_at` | string | ISO 8601 UTC timestamp when calibration began |
+| `completed_at` | string | ISO 8601 UTC timestamp when calibration finished |
+| `parameters` | object | Echo of resolved parameters (after clamping) |
+| `analysis_prompt` | string | Structured prompt instructing Claude how to analyze sweeps and POST corrections to `/auto/calibrate/correct` |
+| `sweeps` | array | Array of 5 sweep results (initial + 4 post-movement) |
+
+**Sweep entry fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `label` | string | Stage identifier: `initial`, `after_forward`, `after_backward`, `after_strafe_left`, `after_strafe_right` |
+| `preceded_by` | string\|null | Movement command that occurred before this sweep (`null` for initial) |
+| `movement` | object\|null | Details of preceding movement (`null` for initial) |
+| `timestamp` | string | ISO 8601 UTC time when the sweep began |
+| `horizontal` | array | Data points from horizontal sweep (pan across range, tilt at 90°) |
+| `vertical` | array | Data points from vertical sweep (tilt across range, pan at 90°) |
+
+**Data point fields (each entry in horizontal/vertical arrays):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pan` | int | Pan servo angle at this position |
+| `tilt` | int | Tilt servo angle at this position |
+| `image` | string\|null | Base64-encoded JPEG, or `null` if capture failed |
+| `ultrasonic_cm` | float\|null | Distance reading, or `null` if sensor failed |
+| `infrared` | object\|null | `{left, middle, right}` IR line sensor states (0/1) |
+| `adc` | object\|null | `{left_photoresistor_v, right_photoresistor_v, battery_voltage}` |
+
+> **Runtime:** With default parameters (pan 30-150 step 15, tilt 60-120 step 15): 9 horizontal + 5 vertical = 14 positions per sweep × 5 sweeps = 70 captures. At ~2s per capture, expect ~2-3 minutes total.
+
+> **Payload size:** ~650KB with default parameters (70 images at ~8KB each + metadata).
+
+> **Analysis workflow:** Same as `/auto/calibrate` — analyze the sweep data, then POST corrections to `/auto/calibrate/correct`. The analysis prompt covers baseline environment mapping, per-movement displacement analysis, servo alignment detection, and motor bias computation.
+
+---
+
 ## System
 
 ### POST /execute
