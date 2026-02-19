@@ -7,6 +7,7 @@ optional and degrade gracefully.
 Dependencies: OpenCV (optional — visual odometry returns confidence=0 without it)
 """
 
+import base64
 import json
 import math
 import os
@@ -501,22 +502,37 @@ class ServoAlignment:
     4. Offset from 90° = pan_offset_deg (applied to all future pan commands)
     """
 
-    def __init__(self, get_ultrasonic_fn, move_servo_smooth_fn):
+    def __init__(self, get_ultrasonic_fn, move_servo_smooth_fn, get_camera_fn=None):
         self._get_ultrasonic = get_ultrasonic_fn
         self._move_servo_smooth = move_servo_smooth_fn
+        self._get_camera = get_camera_fn
 
         self.pan_offset_deg = 0.0
         self.servo_slop_deg = 0.0  # range of angles with same min distance
         self.calibrated = False
 
+    def _capture_image(self):
+        """Capture a camera image and return base64-encoded JPEG, or None."""
+        if not self._get_camera:
+            return None
+        try:
+            jpeg = self._get_camera()
+            if jpeg:
+                return base64.b64encode(jpeg).decode()
+        except Exception:
+            pass
+        return None
+
     def calibrate(self):
         """Run the full servo alignment routine.
 
         Returns:
-            dict with offset, slop, and raw sweep data.
+            dict with offset, slop, raw sweep data, and camera images
+            at each sweep angle for Claude-based correction.
         """
         # Step 1: Coarse sweep to find nearest wall direction
         coarse = {}
+        coarse_images = {}
         for angle in range(30, 151, 10):
             self._move_servo_smooth(1, angle, 200)
             time.sleep(0.15)
@@ -525,6 +541,9 @@ class ServoAlignment:
                 coarse[angle] = dist
             except Exception:
                 coarse[angle] = 999
+            img = self._capture_image()
+            if img:
+                coarse_images[angle] = img
 
         # Find the angle with minimum distance (nearest wall)
         min_angle = min(coarse, key=coarse.get)
@@ -537,6 +556,8 @@ class ServoAlignment:
                 'status': 'no_wall',
                 'message': 'No wall within 200cm for calibration',
                 'pan_offset_deg': 0.0,
+                'coarse_sweep': coarse,
+                'coarse_images': coarse_images,
             }
 
         # Step 2: Fine sweep around the minimum
@@ -544,6 +565,7 @@ class ServoAlignment:
         fine_end = min(120, min_angle + 30)
 
         fine = {}
+        fine_images = {}
         for angle in range(fine_start, fine_end + 1, 1):
             self._move_servo_smooth(1, angle, 200)
             time.sleep(0.15)
@@ -552,6 +574,11 @@ class ServoAlignment:
                 fine[angle] = dist
             except Exception:
                 fine[angle] = 999
+            # Capture image every 5° to keep payload manageable
+            if angle % 5 == 0:
+                img = self._capture_image()
+                if img:
+                    fine_images[angle] = img
 
         # Find true minimum
         true_min_angle = min(fine, key=fine.get)
@@ -576,7 +603,24 @@ class ServoAlignment:
             'wall_distance_cm': true_min_dist,
             'coarse_sweep': coarse,
             'fine_sweep': fine,
+            'coarse_images': coarse_images,
+            'fine_images': fine_images,
         }
+
+    def apply_corrections(self, pan_offset_deg, servo_slop_deg=None):
+        """Override calibrated values with Claude's corrections.
+
+        Args:
+            pan_offset_deg: Corrected servo center offset from 90°.
+            servo_slop_deg: Optional corrected slop value.
+        """
+        self.pan_offset_deg = float(pan_offset_deg)
+        if servo_slop_deg is not None:
+            self.servo_slop_deg = float(servo_slop_deg)
+        self.calibrated = True
+        # Move servo to the corrected center
+        corrected_center = 90 + self.pan_offset_deg
+        self._move_servo_smooth(1, int(round(corrected_center)), 200)
 
     def correct_pan_angle(self, requested_angle):
         """Apply offset correction to a pan angle.

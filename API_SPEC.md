@@ -786,7 +786,7 @@ Reset occupancy grid and/or dead-reckoning pose for fresh exploration.
 
 ### POST /auto/calibrate
 
-Run startup calibration: servo alignment detection + motor bias table seeding. Takes ~30 seconds.
+Rich sensor data collection for Claude-based calibration correction. Performs servo alignment detection with camera images at each sweep angle, then seeds the motor bias table with short movements capturing full sensor data. Takes ~70 seconds.
 
 **Request Body:** `{}` (empty JSON object)
 
@@ -794,37 +794,131 @@ Run startup calibration: servo alignment detection + motor bias table seeding. T
 ```json
 {
   "status": "ok",
+  "analysis_prompt": "<structured prompt with XML tags — see below>",
   "servo_alignment": {
     "status": "ok",
     "pan_offset_deg": -2.0,
     "servo_slop_deg": 3.0,
     "true_center_angle": 88,
     "wall_distance_cm": 62.3,
-    "coarse_sweep": {"30": 150.2, "40": 145.1, "50": 138.9},
-    "fine_sweep": {"60": 125.3, "61": 124.8, "62": 124.2}
+    "coarse_sweep": {"30": 150.2, "40": 145.1, "50": 138.9, "...": "..."},
+    "fine_sweep": {"60": 125.3, "61": 124.8, "62": 124.2, "...": "..."},
+    "coarse_images": {"30": "<base64 JPEG>", "40": "<base64 JPEG>", "...": "..."},
+    "fine_images": {"60": "<base64 JPEG>", "65": "<base64 JPEG>", "...": "..."}
   },
+  "scene_image": "<base64 JPEG of resting-state photo>",
+  "ir_baseline": {"left": 1, "center": 1, "right": 0},
+  "battery_voltage": 7.8,
   "bias_seed": [
-    {"command": "forward", "fusion": {"dx_cm": 24.3, "dy_cm": 0.1, "d_theta_deg": 0.5, "weights": {"visual": 0.45, "ultrasonic": 0.35, "dead_reckoning": 0.2}, "fused": true}},
-    {"command": "backward", "fusion": {"dx_cm": -23.8, "dy_cm": -0.2, "d_theta_deg": -0.3, "weights": {"visual": 0.42, "ultrasonic": 0.38, "dead_reckoning": 0.2}, "fused": true}},
-    {"command": "strafe_left", "fusion": {"dx_cm": 0.2, "dy_cm": 24.1, "d_theta_deg": 0.1, "weights": {"visual": 0.48, "ultrasonic": 0.32, "dead_reckoning": 0.2}, "fused": true}},
-    {"command": "strafe_right", "fusion": {"dx_cm": -0.1, "dy_cm": -24.5, "d_theta_deg": -0.2, "weights": {"visual": 0.46, "ultrasonic": 0.34, "dead_reckoning": 0.2}, "fused": true}}
+    {
+      "command": "forward",
+      "speed": 1500,
+      "requested_duration": 0.5,
+      "actual_duration": 0.487,
+      "pre_distance_cm": 35.6,
+      "post_distance_cm": 30.2,
+      "infrared": {"left": 1, "middle": 1, "right": 0},
+      "battery_voltage": 7.8,
+      "collision": false,
+      "stuck": false,
+      "pose": {"x_cm": 0.0, "y_cm": 5.1, "heading_deg": 90.0},
+      "fusion": {"dx_cm": 24.3, "dy_cm": 0.1, "d_theta_deg": 0.5, "weights": {"visual": 0.45, "ultrasonic": 0.35, "dead_reckoning": 0.2}, "fused": true},
+      "before_image": "<base64 JPEG>",
+      "after_image": "<base64 JPEG>",
+      "calibration_warning": false,
+      "bias_stale": false
+    }
   ],
   "bias_table": {
     "forward": {"lateral": 0.2, "rotation": 1.1, "speed_scale": 0.92},
-    "backward": {"lateral": -0.1, "rotation": -0.5, "speed_scale": 0.88},
-    "strafe_left": {"lateral": 0.0, "rotation": 0.3, "speed_scale": 0.95},
-    "strafe_right": {"lateral": 0.1, "rotation": -0.4, "speed_scale": 0.94}
+    "backward": {"lateral": -0.1, "rotation": -0.5, "speed_scale": 0.88}
+  },
+  "raw_calibration": {
+    "computed_pan_offset_deg": -2.0,
+    "notes": "Algorithmic result — submit to POST /auto/calibrate/correct for Claude correction"
   }
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `servo_alignment` | object | Results from servo centering: offset from 90°, slop range, true center angle, and wall distance |
-| `bias_seed` | array | Fusion results from initial seed movements (forward, backward, strafe_left, strafe_right) |
-| `bias_table` | object | Learned motor correction factors for each command (lateral drift, rotation bias, speed scale) |
+| `analysis_prompt` | string | Structured prompt (XML tags) instructing Claude how to analyze the data and POST corrections to `/auto/calibrate/correct`. Covers scene understanding, sweep analysis, seed movement interpretation, and the exact correction JSON schema. |
+| `servo_alignment` | object | Servo centering results including `coarse_images` (13 images at 10° steps) and `fine_images` (every 5° around minimum) |
+| `scene_image` | string\|null | Base64 JPEG of the resting scene before any movement |
+| `ir_baseline` | object\|null | IR sensor readings at rest (left, center, right) |
+| `battery_voltage` | float\|null | Battery voltage at calibration start |
+| `bias_seed` | array | Full step results from seed movements (forward, backward, strafe_left, strafe_right) including before/after images, distances, IR, fusion |
+| `bias_table` | object | Learned motor correction factors per command |
+| `raw_calibration` | object | The algorithmic offset result, flagged for Claude correction |
+
+> **Payload size:** ~515KB total (34 images at ~15KB each + metadata).
 
 > **When to run:** Once per session, or after battery swap. The car should be facing a wall within 200cm.
+
+> **Claude-in-the-loop workflow:**
+> 1. Call `POST /auto/calibrate` → receive rich sensor data with images
+> 2. Analyze images + ultrasonic profiles + IR + fusion results
+> 3. Determine true forward direction, wall locations, motor drift
+> 4. Call `POST /auto/calibrate/correct` → push corrected parameters
+
+---
+
+### POST /auto/calibrate/correct
+
+Accept Claude's corrections to calibration parameters after analyzing the rich data from `/auto/calibrate`.
+
+**Request Body:**
+```json
+{
+  "pan_offset_deg": -14.0,
+  "servo_slop_deg": 16,
+  "motor_biases": {
+    "forward": {"lateral": -2.1, "rotation": -0.5, "speed_scale": 0.95},
+    "strafe_left": {"lateral": -5.0, "rotation": -1.2, "speed_scale": 1.0}
+  },
+  "speed_calibration_factor": 0.05,
+  "rotation_calibration_factor": 0.8,
+  "notes": "Wall identified at 90° in coarse sweep. Shoe rack at 45° produced misleading short distance."
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `pan_offset_deg` | float | Yes | Corrected servo center offset from 90° |
+| `servo_slop_deg` | float | No | Corrected slop value |
+| `motor_biases` | object | No | Per-command bias overrides (keys: lateral, rotation, speed_scale) |
+| `speed_calibration_factor` | float | No | Override PoseTracker cm per (PWM × second) |
+| `rotation_calibration_factor` | float | No | Override PoseTracker degrees per (PWM × second) |
+| `notes` | string | No | Claude's reasoning trail for debugging |
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "applied": {
+    "pan_offset_deg": -14.0,
+    "servo_slop_deg": 16.0,
+    "motor_biases_updated": ["forward", "strafe_left"],
+    "speed_calibration_factor": 0.05,
+    "rotation_calibration_factor": 0.8
+  },
+  "notes": "Wall identified at 90° in coarse sweep...",
+  "current_state": {
+    "servo_offset": -14.0,
+    "servo_slop": 16.0,
+    "bias_table": {"forward": {"lateral": -2.1, "rotation": -0.5, "speed_scale": 0.95}},
+    "pose_calibration": {"speed": 0.05, "rotation": 0.8}
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `applied` | object | Summary of what was applied |
+| `notes` | string | Echo of Claude's reasoning |
+| `current_state` | object | Full current calibration state for verification |
+
+> **Effects:** Servo physically moves to corrected center. Motor bias overrides persist to `motor_bias.json`. Speed/rotation factors update PoseTracker immediately. Subsequent `/auto/step` calls use the corrected values.
 
 ---
 

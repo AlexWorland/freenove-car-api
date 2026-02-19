@@ -15,6 +15,7 @@ Architecture:
 No external dependencies — stdlib only.
 """
 
+import base64
 import math
 import threading
 import time
@@ -462,7 +463,10 @@ class AutonomyModule:
         self.safety = SafetyMonitor(get_ultrasonic_fn, get_motor_fn)
 
         # Calibration components (servo_align first — others depend on it)
-        self.servo_align = ServoAlignment(get_ultrasonic_fn, move_servo_smooth_fn)
+        self.servo_align = ServoAlignment(
+            get_ultrasonic_fn, move_servo_smooth_fn,
+            get_camera_fn=self._get_camera
+        )
         self.visual_odom = VisualOdometry()
         self.ultrasonic_ref = UltrasonicReference(
             get_ultrasonic_fn, get_servo_fn, move_servo_smooth_fn,
@@ -631,6 +635,8 @@ class AutonomyModule:
             battery = self._read_battery()
 
             # Pre-movement calibration captures
+            before_jpeg = None
+            after_jpeg = None
             if self._correction_enabled:
                 if self._get_camera:
                     try:
@@ -687,7 +693,7 @@ class AutonomyModule:
                             after_jpeg, distance_cm=max(pre_distance, 10)
                         )
                     except Exception:
-                        pass
+                        after_jpeg = None
 
                 # Ultrasonic reference
                 self.ultrasonic_ref.capture_after()
@@ -762,6 +768,11 @@ class AutonomyModule:
                 result['fusion'] = fusion_result
                 result['calibration_warning'] = self.bias_table.calibration_warning
                 result['bias_stale'] = self.bias_table.stale
+
+            if before_jpeg:
+                result['before_image'] = base64.b64encode(before_jpeg).decode()
+            if after_jpeg:
+                result['after_image'] = base64.b64encode(after_jpeg).decode()
 
             return result
 

@@ -283,6 +283,136 @@ def _mjpeg_generator(width=320, height=240, fps=10):
 
 
 # ---------------------------------------------------------------------------
+# Calibration analysis prompt — embedded in /auto/calibrate response so any
+# Claude session can process the data without prior context about the car.
+# ---------------------------------------------------------------------------
+
+CALIBRATION_ANALYSIS_PROMPT = """
+<context>
+You are analyzing calibration data from a Freenove 4WD Smart Car with mecanum wheels.
+The car has an ultrasonic distance sensor and camera mounted on a pan/tilt servo head,
+3 IR line-tracking sensors underneath, and a battery. The pan servo's 90° position
+SHOULD point straight ahead, but manufacturing variance means the true center is offset.
+
+The car performed:
+1. A coarse ultrasonic sweep (30°-150° in 10° steps) with a camera image at each angle
+2. A fine ultrasonic sweep (1° steps around the coarse minimum) with camera images every 5°
+3. Four seed movements (forward, backward, strafe_left, strafe_right) at speed=1500 for 0.5s each,
+   capturing before/after camera images, ultrasonic distances, IR readings, and sensor fusion results
+
+The Pi's algorithm found the minimum ultrasonic distance and assumed perpendicular-to-wall = straight ahead.
+This heuristic fails in corners, near shoe racks, curtains, or irregular surfaces. Your job is to do better.
+</context>
+
+<task>
+Analyze ALL the provided sensor data to determine the car's true forward direction and motor behavior,
+then POST corrections to /auto/calibrate/correct on the same host.
+
+Perform these analysis steps in order:
+</task>
+
+<step_1_scene_understanding>
+Examine scene_image (the resting photo before any movement).
+Identify the environment: hallway, room corner, open space, cluttered area.
+Note any objects that could produce misleading ultrasonic readings (soft furnishings absorb sound,
+narrow objects give inconsistent returns, angled surfaces deflect rather than reflect).
+</step_1_scene_understanding>
+
+<step_2_coarse_sweep>
+Examine servo_alignment.coarse_sweep (angle→distance map) alongside servo_alignment.coarse_images.
+
+For each angle, the image shows what the sensor is pointed at.
+Identify which angles show a flat, solid wall vs. clutter, furniture edges, or open space.
+A flat wall produces a smooth distance curve with a clear minimum at the perpendicular angle.
+Clutter or corners produce jagged or multi-modal distance profiles.
+
+Determine which surface (if any) is a reliable calibration reference wall.
+</step_2_coarse_sweep>
+
+<step_3_fine_sweep>
+Examine servo_alignment.fine_sweep and servo_alignment.fine_images.
+
+The fine sweep has 1° resolution. Look for:
+- The true minimum distance angle (this is the perpendicular to the nearest surface)
+- The shape of the curve around the minimum: a broad U-shape suggests a flat wall (good reference);
+  a sharp V-shape or noisy profile suggests a corner, pole, or irregular surface (unreliable)
+- servo_alignment.servo_slop_deg: how many degrees share nearly the same minimum distance.
+  High slop (>10°) on a flat wall is normal; high slop on clutter means the minimum is ambiguous.
+
+If the reference surface is reliable, the true forward direction = fine sweep minimum angle.
+pan_offset_deg = (true_forward_angle - 90).
+</step_3_fine_sweep>
+
+<step_4_seed_movements>
+Examine each entry in bias_seed. Each contains:
+- command: which direction the car was told to move
+- before_image / after_image: visual confirmation of actual movement
+- pre_distance_cm / post_distance_cm: ultrasonic before/after
+- fusion: sensor-fused displacement estimate (dx_cm, dy_cm, d_theta_deg)
+- infrared: IR line sensors (0=no line, 1=line detected)
+
+For each seed movement, assess:
+- Did the car move in the expected direction? (forward should decrease distance to front wall)
+- How much lateral drift (dy_cm) and rotation (d_theta_deg) occurred?
+- Is the fusion result consistent with the visual before/after difference?
+- Any collisions or stuck conditions?
+
+Systematic patterns reveal motor biases. For example, if forward consistently drifts left (positive dy_cm),
+the right-side motors are stronger and need correction.
+</step_4_seed_movements>
+
+<step_5_compute_corrections>
+Based on your analysis, determine:
+
+1. pan_offset_deg: The corrected servo center offset. This is the most critical value.
+   If you identified a reliable wall, use the perpendicular angle minus 90.
+   If no reliable wall, use visual cues from images to estimate forward direction.
+   If uncertain, prefer the algorithmic result in raw_calibration.computed_pan_offset_deg.
+
+2. motor_biases (optional): Per-command corrections if seed movements revealed systematic drift.
+   Only override if you have clear evidence. Each bias has:
+   - lateral: cm/sec of lateral drift (positive = left). Counter observed drift.
+   - rotation: deg/sec of unwanted rotation (positive = CCW). Counter observed rotation.
+   - speed_scale: ratio of actual vs commanded speed. Usually 0.8-1.0.
+
+3. speed_calibration_factor (optional): cm per (PWM_unit × second). Default is 0.007.
+   Only adjust if fusion dx_cm values are consistently larger or smaller than expected
+   for the commanded speed and duration.
+
+4. rotation_calibration_factor (optional): degrees per (PWM_unit × second). Default is 0.09.
+   Only adjust if rotation commands show systematic over/under-rotation.
+</step_5_compute_corrections>
+
+<output_format>
+POST your corrections as JSON to /auto/calibrate/correct on the same host:
+
+{
+  "pan_offset_deg": <float, required>,
+  "servo_slop_deg": <float, optional>,
+  "motor_biases": {
+    "<command_name>": {"lateral": <float>, "rotation": <float>, "speed_scale": <float>},
+    ...
+  },
+  "speed_calibration_factor": <float, optional>,
+  "rotation_calibration_factor": <float, optional>,
+  "notes": "<your reasoning: what you identified in the images, why you chose this offset, confidence level>"
+}
+
+Always include a detailed notes field explaining your reasoning — this is the audit trail
+for debugging calibration issues.
+</output_format>
+
+<constraints>
+- pan_offset_deg is required. All other fields are optional.
+- Only include motor_biases for commands where you have clear evidence of systematic drift.
+- If the environment has no reliable reference wall, say so in notes and use the algorithmic result.
+- Prefer conservative corrections — a small accurate offset is better than a large uncertain one.
+- The notes field should mention which images/angles informed your decision and your confidence level.
+</constraints>
+""".strip()
+
+
+# ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
 
@@ -320,7 +450,8 @@ def index():
                 "GET /auto/state": "Read-only state (pose, flags, optional grid)",
                 "POST /auto/configure": "Tune safety thresholds and calibration",
                 "POST /auto/reset": "Reset grid and/or pose",
-                "POST /auto/calibrate": "Startup calibration — servo alignment + bias seeding (~30s)",
+                "POST /auto/calibrate": "Rich sensor data collection — servo alignment + images + bias seeding (~70s)",
+                "POST /auto/calibrate/correct": "Apply Claude's calibration corrections",
             },
             "calibration": {
                 "POST /calibrate": "Single direction calibration {direction, speed, duration}",
@@ -787,22 +918,52 @@ def auto_reset():
 def auto_calibrate():
     """Run startup calibration: servo alignment + bias table seeding.
 
-    This takes ~30 seconds. Run once per session or after battery swap.
+    Collects rich multi-sensor data (ultrasonic sweeps, camera images at
+    each angle, IR readings, battery data) for Claude-based correction.
+    Takes ~70 seconds. Run once per session or after battery swap.
     """
     auto = get_autonomy()
 
-    # Step 1: Servo alignment
+    # Capture a resting-state scene image before any movement
+    scene_image = None
+    try:
+        jpeg = _capture_jpeg()
+        if jpeg:
+            scene_image = base64.b64encode(jpeg).decode()
+    except Exception:
+        pass
+
+    # Capture IR baseline at rest
+    ir_baseline = None
+    try:
+        ir = get_infrared()
+        ir_baseline = {
+            'left': ir.read_one_infrared(1),
+            'center': ir.read_one_infrared(2),
+            'right': ir.read_one_infrared(3),
+        }
+    except Exception:
+        pass
+
+    # Battery voltage at start
+    battery_voltage = None
+    try:
+        adc = get_adc()
+        raw = adc.read_adc(2)
+        multiplier = 3 if adc.pcb_version == 1 else 2
+        battery_voltage = round(raw * multiplier, 2)
+    except Exception:
+        pass
+
+    # Step 1: Servo alignment (now includes camera images at sweep angles)
     servo_result = auto.servo_align.calibrate()
 
-    # Step 2: Seed bias table with short movements
+    # Step 2: Seed bias table with short movements — pass through full results
     seed_commands = ['forward', 'backward', 'strafe_left', 'strafe_right']
     seed_results = []
     for cmd in seed_commands:
         step = auto.execute_step(command=cmd, speed=1500, duration=0.5)
-        seed_results.append({
-            'command': cmd,
-            'fusion': step.get('fusion'),
-        })
+        seed_results.append(step)
         time.sleep(0.5)
 
     # Save bias table after seeding
@@ -810,9 +971,88 @@ def auto_calibrate():
 
     return jsonify({
         'status': 'ok',
+        'analysis_prompt': CALIBRATION_ANALYSIS_PROMPT,
         'servo_alignment': servo_result,
+        'scene_image': scene_image,
+        'ir_baseline': ir_baseline,
+        'battery_voltage': battery_voltage,
         'bias_seed': seed_results,
         'bias_table': auto.bias_table.table,
+        'raw_calibration': {
+            'computed_pan_offset_deg': servo_result.get('pan_offset_deg', 0.0),
+            'notes': 'Algorithmic result — submit to POST /auto/calibrate/correct for Claude correction',
+        },
+    })
+
+
+@app.route("/auto/calibrate/correct", methods=["POST"])
+def auto_calibrate_correct():
+    """Accept Claude's corrections to calibration parameters.
+
+    Claude analyzes the rich sensor data from /auto/calibrate and pushes
+    back corrected parameters: servo offset, motor biases, speed/rotation
+    calibration factors.
+    """
+    data = request.get_json(force=True)
+    auto = get_autonomy()
+
+    if 'pan_offset_deg' not in data:
+        return jsonify({
+            'error': 'pan_offset_deg is required',
+            'accepted_fields': [
+                'pan_offset_deg', 'servo_slop_deg', 'motor_biases',
+                'speed_calibration_factor', 'rotation_calibration_factor', 'notes',
+            ],
+        }), 400
+
+    applied = {}
+
+    # Apply servo alignment corrections
+    servo_slop = data.get('servo_slop_deg')
+    auto.servo_align.apply_corrections(data['pan_offset_deg'], servo_slop_deg=servo_slop)
+    applied['pan_offset_deg'] = auto.servo_align.pan_offset_deg
+    if servo_slop is not None:
+        applied['servo_slop_deg'] = auto.servo_align.servo_slop_deg
+
+    # Apply motor bias overrides
+    motor_biases = data.get('motor_biases')
+    biases_updated = []
+    if motor_biases and isinstance(motor_biases, dict):
+        for cmd, bias_data in motor_biases.items():
+            if cmd in auto.bias_table.COMMANDS and isinstance(bias_data, dict):
+                current = auto.bias_table.get_bias(cmd)
+                for key in ('lateral', 'rotation', 'speed_scale'):
+                    if key in bias_data:
+                        current[key] = float(bias_data[key])
+                auto.bias_table.table[cmd] = current
+                biases_updated.append(cmd)
+        if biases_updated:
+            auto.bias_table.save()
+    applied['motor_biases_updated'] = biases_updated
+
+    # Apply speed calibration factor
+    if 'speed_calibration_factor' in data:
+        auto.pose.SPEED_CALIBRATION_FACTOR = float(data['speed_calibration_factor'])
+        applied['speed_calibration_factor'] = auto.pose.SPEED_CALIBRATION_FACTOR
+
+    # Apply rotation calibration factor
+    if 'rotation_calibration_factor' in data:
+        auto.pose.ROTATION_CALIBRATION_FACTOR = float(data['rotation_calibration_factor'])
+        applied['rotation_calibration_factor'] = auto.pose.ROTATION_CALIBRATION_FACTOR
+
+    return jsonify({
+        'status': 'ok',
+        'applied': applied,
+        'notes': data.get('notes', ''),
+        'current_state': {
+            'servo_offset': auto.servo_align.pan_offset_deg,
+            'servo_slop': auto.servo_align.servo_slop_deg,
+            'bias_table': auto.bias_table.table,
+            'pose_calibration': {
+                'speed': auto.pose.SPEED_CALIBRATION_FACTOR,
+                'rotation': auto.pose.ROTATION_CALIBRATION_FACTOR,
+            },
+        },
     })
 
 
