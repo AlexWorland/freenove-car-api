@@ -212,23 +212,31 @@ class UltrasonicReference:
     SETTLE_TIME = 0.15  # seconds for servo to reach position
     MAX_RELIABLE_DISTANCE = 150  # cm — beyond this, confidence drops
 
-    def __init__(self, get_ultrasonic_fn, get_servo_fn, move_servo_smooth_fn):
+    def __init__(self, get_ultrasonic_fn, get_servo_fn, move_servo_smooth_fn,
+                 servo_alignment=None):
         self._get_ultrasonic = get_ultrasonic_fn
         self._get_servo = get_servo_fn
         self._move_servo_smooth = move_servo_smooth_fn
+        self._servo_alignment = servo_alignment
 
         self._before_readings = None
         self._after_readings = None
+
+    def _corrected_pan(self, angle):
+        """Apply servo alignment offset if available."""
+        if self._servo_alignment and self._servo_alignment.calibrated:
+            return self._servo_alignment.correct_pan_angle(angle)
+        return angle
 
     def sweep(self):
         """Perform a 3-point ultrasonic sweep at SWEEP_ANGLES.
 
         Returns:
-            dict mapping angle -> distance_cm, e.g. {45: 120.3, 90: 85.1, 135: 110.7}
+            dict mapping logical angle -> distance_cm, e.g. {45: 120.3, 90: 85.1, 135: 110.7}
         """
         readings = {}
         for angle in self.SWEEP_ANGLES:
-            self._move_servo_smooth(1, angle, 200)  # pan channel = 1
+            self._move_servo_smooth(1, self._corrected_pan(angle), 200)
             time.sleep(self.SETTLE_TIME)
             try:
                 dist = self._get_ultrasonic().get_distance()
@@ -236,8 +244,8 @@ class UltrasonicReference:
             except Exception:
                 readings[angle] = -1
 
-        # Return pan to center
-        self._move_servo_smooth(1, 90, 200)
+        # Return pan to corrected center
+        self._move_servo_smooth(1, self._corrected_pan(90), 200)
         return readings
 
     def capture_before(self):
@@ -557,8 +565,8 @@ class ServoAlignment:
         self.pan_offset_deg = true_min_angle - 90.0
         self.calibrated = True
 
-        # Return to corrected center
-        self._move_servo_smooth(1, 90, 200)
+        # Return to corrected center (true straight ahead)
+        self._move_servo_smooth(1, true_min_angle, 200)
 
         return {
             'status': 'ok',

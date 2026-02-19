@@ -278,7 +278,13 @@ class SafetyMonitor:
     motor/servo commands.
     """
 
-    FORWARD_COMMANDS = frozenset({'forward', 'diagonal_fl', 'diagonal_fr'})
+    # Commands where the sensor faces the direction of travel — collision
+    # avoidance applies.  Excludes backward (sensor can't see behind) and
+    # pure rotations (no translational motion toward obstacles).
+    COLLISION_COMMANDS = frozenset({
+        'forward', 'diagonal_fl', 'diagonal_fr',
+        'strafe_left', 'strafe_right', 'left', 'right',
+    })
 
     def __init__(self, get_ultrasonic_fn, get_motor_fn,
                  collision_threshold_cm=15,
@@ -332,7 +338,7 @@ class SafetyMonitor:
                 dist = self._get_ultrasonic().get_distance()
 
                 # -- Collision avoidance --
-                if (self._active_command in self.FORWARD_COMMANDS
+                if (self._active_command in self.COLLISION_COMMANDS
                         and dist < self.collision_threshold_cm):
                     self._get_motor().set_motor_model(0, 0, 0, 0)
                     self.collision_flag = True
@@ -393,6 +399,25 @@ class AutonomyModule:
     PAN_CHANNEL = 1
     TILT_CHANNEL = 0
 
+    # Logical pan angle the sensor should face for each movement direction.
+    # 90° = straight ahead, 45° = right, 135° = left.
+    # Backward commands keep sensor forward — it cannot physically look behind.
+    COMMAND_FACING = {
+        "forward":      90,
+        "backward":     90,
+        "left":         135,
+        "right":        45,
+        "strafe_left":  135,
+        "strafe_right": 45,
+        "rotate_cw":    90,
+        "rotate_ccw":   90,
+        "diagonal_fl":  115,
+        "diagonal_fr":  65,
+        "diagonal_bl":  90,
+        "diagonal_br":  90,
+        "stop":         90,
+    }
+
     # Pre-built recovery maneuvers: list of (command, speed, duration_sec)
     RECOVERY_MANEUVERS = {
         "back_up": [
@@ -436,13 +461,14 @@ class AutonomyModule:
         self.pose = PoseTracker()
         self.safety = SafetyMonitor(get_ultrasonic_fn, get_motor_fn)
 
-        # Calibration components
+        # Calibration components (servo_align first — others depend on it)
+        self.servo_align = ServoAlignment(get_ultrasonic_fn, move_servo_smooth_fn)
         self.visual_odom = VisualOdometry()
         self.ultrasonic_ref = UltrasonicReference(
-            get_ultrasonic_fn, get_servo_fn, move_servo_smooth_fn
+            get_ultrasonic_fn, get_servo_fn, move_servo_smooth_fn,
+            servo_alignment=self.servo_align
         )
         self.bias_table = MotorBiasTable()
-        self.servo_align = ServoAlignment(get_ultrasonic_fn, move_servo_smooth_fn)
         self.fusion = SensorFusion()
 
         self._correction_enabled = True  # can be toggled via configure()
@@ -502,7 +528,8 @@ class AutonomyModule:
         time.sleep(0.1)
 
         for pan_angle in range(pan_min, pan_max + 1, step):
-            self._move_servo_smooth(self.PAN_CHANNEL, pan_angle, 200)
+            servo_angle = self.servo_align.correct_pan_angle(pan_angle)
+            self._move_servo_smooth(self.PAN_CHANNEL, servo_angle, 200)
             time.sleep(settle_ms / 1000.0)
 
             dist = self._read_distance()
@@ -519,8 +546,10 @@ class AutonomyModule:
                     pose['x_cm'], pose['y_cm'], world_angle, dist
                 )
 
-        # Return pan to center
-        self._move_servo_smooth(self.PAN_CHANNEL, 90, 200)
+        # Return pan to corrected center
+        self._move_servo_smooth(
+            self.PAN_CHANNEL, self.servo_align.correct_pan_angle(90), 200
+        )
 
         return {
             'readings': readings,
@@ -590,7 +619,13 @@ class AutonomyModule:
             speed = max(0, min(4095, speed))
             duration = max(0.1, min(10.0, duration))
 
-            # Pre-movement sensors
+            # Orient sensor toward direction of travel
+            facing_angle = self.COMMAND_FACING.get(command, 90)
+            servo_angle = self.servo_align.correct_pan_angle(facing_angle)
+            self._move_servo_smooth(self.PAN_CHANNEL, servo_angle, 200)
+            time.sleep(0.15)
+
+            # Pre-movement sensors (now reading in the direction of travel)
             pre_distance = self._read_distance()
             ir_data = self._read_infrared()
             battery = self._read_battery()

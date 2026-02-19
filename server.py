@@ -798,7 +798,7 @@ def auto_calibrate():
     seed_commands = ['forward', 'backward', 'strafe_left', 'strafe_right']
     seed_results = []
     for cmd in seed_commands:
-        step = auto.execute_step(command=cmd, speed=500, duration=0.5)
+        step = auto.execute_step(command=cmd, speed=1500, duration=0.5)
         seed_results.append({
             'command': cmd,
             'fusion': step.get('fusion'),
