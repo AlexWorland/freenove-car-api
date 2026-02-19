@@ -603,7 +603,7 @@ Core decision cycle — one HTTP call per decision. Supports movement commands, 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `command` | string | "forward" | Movement command (same names as `/control/motors`) |
-| `speed` | int | 1500 | Motor PWM speed (0-4095) |
+| `speed` | int | 500 | Motor PWM speed (0-4095) |
 | `duration` | float | 0.5 | Movement duration in seconds (0.1-10.0) |
 | `action` | string | null | Override: `"scan"`, `"recover"`, or `"stop"` |
 | `scan_params` | object | null | Parameters for scan action (see `/auto/scan`) |

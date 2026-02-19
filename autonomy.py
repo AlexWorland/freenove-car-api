@@ -512,7 +512,7 @@ class AutonomyModule:
 
     # -- Step (core decision cycle) -------------------------------------------
 
-    def execute_step(self, command=None, speed=1500, duration=0.5,
+    def execute_step(self, command=None, speed=500, duration=0.5,
                      action=None, scan_params=None, recover_maneuver=None):
         """One complete sense-act cycle. This is the primary endpoint for Claude.
 
@@ -524,7 +524,7 @@ class AutonomyModule:
 
         Args:
             command: Movement command name (forward, backward, etc.).
-            speed: PWM speed 0-4095 (default 1500).
+            speed: PWM speed 0-4095 (default 500).
             duration: Movement duration in seconds (default 0.5).
             action: Override action type.
             scan_params: Optional dict of scan parameters.

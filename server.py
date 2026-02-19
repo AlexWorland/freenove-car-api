@@ -38,6 +38,8 @@ _buzzer_pwm = None
 _led_animation_thread = None
 _led_animation_stop = threading.Event()
 _autonomy = None
+_battery_led_active = True  # True = battery monitor owns LEDs
+_battery_led_stop = threading.Event()
 
 # Track current servo positions for interpolation
 _servo_positions = {0: 90, 1: 90}
@@ -187,6 +189,52 @@ def _run_animation(name, duration):
 
     _led_animation_thread = threading.Thread(target=_loop, daemon=True)
     _led_animation_thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Battery LED monitor
+# ---------------------------------------------------------------------------
+
+BATTERY_LED_BRIGHTNESS = 25  # ~10% of max 255
+BATTERY_MIN_V = 6.0   # 2S Li-ion empty
+BATTERY_MAX_V = 8.4   # 2S Li-ion full
+BATTERY_LED_INTERVAL = 30  # seconds between updates
+
+
+def _voltage_to_rgb(voltage):
+    """Map battery voltage to red-yellow-green gradient."""
+    pct = max(0.0, min(1.0, (voltage - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V)))
+    if pct < 0.5:
+        # Red → Yellow
+        t = pct / 0.5
+        return (255, int(255 * t), 0)
+    else:
+        # Yellow → Green
+        t = (pct - 0.5) / 0.5
+        return (int(255 * (1 - t)), 255, 0)
+
+
+def _battery_led_loop():
+    """Background thread: update LEDs with battery level color."""
+    while not _battery_led_stop.is_set():
+        if _battery_led_active:
+            try:
+                adc = get_adc()
+                raw = adc.read_adc(2)
+                multiplier = 3 if adc.pcb_version == 1 else 2
+                voltage = raw * multiplier
+
+                r, g, b = _voltage_to_rgb(voltage)
+                led = get_led()
+                if led.is_support_led_function:
+                    led.strip.set_led_brightness(BATTERY_LED_BRIGHTNESS)
+                    for i in range(8):
+                        led.strip.set_led_rgb_data(i, [r, g, b])
+                    led.strip.show()
+            except Exception:
+                pass
+
+        _battery_led_stop.wait(BATTERY_LED_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +523,7 @@ def control_servos():
 
 @app.route("/control/leds", methods=["POST"])
 def control_leds():
+    global _battery_led_active
     data = request.get_json(force=True)
     led = get_led()
 
@@ -484,6 +533,7 @@ def control_leds():
     # Animation mode
     animation = data.get("animation")
     if animation:
+        _battery_led_active = False
         duration = data.get("duration")
         _run_animation(animation, duration)
         return jsonify({"status": "ok", "animation": animation, "duration": duration})
@@ -499,6 +549,7 @@ def control_leds():
     # Color mode
     color = data.get("color")
     if color and isinstance(color, list) and len(color) == 3:
+        _battery_led_active = False
         r, g, b = [max(0, min(255, int(c))) for c in color]
         index = data.get("index")  # specific LED index (1-8) or None for all
         if index is not None:
@@ -510,10 +561,11 @@ def control_leds():
             led.strip.show()
             return jsonify({"status": "ok", "color": [r, g, b], "all": True})
 
-    # Off
+    # Off — return LED ownership to battery monitor
     if data.get("off"):
         led.colorBlink(0)
-        return jsonify({"status": "ok", "leds": "off"})
+        _battery_led_active = True
+        return jsonify({"status": "ok", "leds": "off", "battery_led": "resumed"})
 
     return jsonify({"status": "ok"})
 
@@ -642,7 +694,7 @@ def auto_step():
 
     action = data.get("action")
     command = data.get("command")
-    speed = data.get("speed", 1500)
+    speed = data.get("speed", 500)
     duration = data.get("duration", 0.5)
     scan_params = data.get("scan_params")
     recover_maneuver = data.get("recover_maneuver")
@@ -1286,6 +1338,9 @@ def dashboard():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Start battery LED monitor
+    threading.Thread(target=_battery_led_loop, daemon=True).start()
+
     print("Starting Freenove Car API server on port 5000...")
     print("Dashboard: http://0.0.0.0:5000/dashboard")
     print("API: http://0.0.0.0:5000/")
